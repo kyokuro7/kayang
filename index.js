@@ -144,21 +144,53 @@ async function scrapePreset(targetUrl) {
   throw new Error(apiError(lastErr));
 }
 
+// Kumpulkan semua URL dari hasil JSON (nama field & struktur bisa berbeda-beda)
+function collectUrls(obj, key = '', out = []) {
+  if (obj == null) return out;
+  if (typeof obj === 'string') {
+    if (/^https?:\/\//i.test(obj.trim())) out.push({ key: key.toLowerCase(), url: obj.trim() });
+  } else if (Array.isArray(obj)) {
+    obj.forEach((v, i) => collectUrls(v, key || String(i), out));
+  } else if (typeof obj === 'object') {
+    for (const [k, v] of Object.entries(obj)) collectUrls(v, k, out);
+  }
+  return out;
+}
+
+function classifyResult(data) {
+  const links = collectUrls(data);
+  const seen = new Set();
+  const r = { alight: [], xml: [], thumb: [], other: [], size: null };
+  for (const { key, url } of links) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const u = url.toLowerCase();
+    if (/thumb|cover|image|preview|poster/.test(key) || /\.(jpe?g|png|webp)(\?|$)/.test(u)) r.thumb.push(url);
+    else if (/xml/.test(key) || u.includes('drive.google') || u.includes('docs.google')) r.xml.push(url);
+    else if (/alight|creative|preset/.test(key) || /alight\.link|alightcreative|alightmotion|alight\.me/.test(u)) r.alight.push(url);
+    else r.other.push(url);
+  }
+  const root = (data && typeof data.data === 'object' && data.data) || data || {};
+  r.size = data.alight_creative_size || root.alight_creative_size || null;
+  r.total = r.alight.length + r.xml.length + r.other.length + r.thumb.length;
+  return r;
+}
+
 function formatResult(data) {
+  const r = classifyResult(data);
   let msg = '<b>😆 PRESET KETEMU BOSQ ✨</b>\n\n';
-  
-  if (data.alight_creative_url) {
-    msg += `<b>😼 ${data.alight_creative_size || '? MB'} :</b> <a href="${data.alight_creative_url}">Link Alight Creative</a>\n`;
-  }
-  if (data.xml_url) {
-    msg += `<b>🔥 XML :</b> <a href="${data.xml_url}">Link XML Google Drive</a>\n`;
-  }
-  if (data.url && data.url !== data.alight_creative_url && data.url !== data.xml_url) {
-    msg += `<b>📱 URL  :</b> <a href="${data.url}">${data.url}</a>\n`;
-  }
-  if (data.thumbnail) {
-    msg += `\n<b>🖼 Thumbnail:</b> <a href="${data.thumbnail}">Lihat</a>`;
-  }
+  const a = (u, t) => `<a href="${escapeHtml(u)}">${escapeHtml(t)}</a>`;
+
+  r.alight.forEach((u, i) => {
+    msg += `<b>😼 ${escapeHtml(r.size || '? MB')} :</b> ${a(u, 'Link Alight Creative' + (r.alight.length > 1 ? ` ${i + 1}` : ''))}\n`;
+  });
+  r.xml.forEach((u, i) => {
+    msg += `<b>🔥 XML :</b> ${a(u, 'Link XML Google Drive' + (r.xml.length > 1 ? ` ${i + 1}` : ''))}\n`;
+  });
+  r.other.forEach((u) => {
+    msg += `<b>📱 URL  :</b> ${a(u, u)}\n`;
+  });
+  if (r.thumb.length) msg += `\n<b>🖼 Thumbnail:</b> ${a(r.thumb[0], 'Lihat')}`;
   return msg;
 }
 
@@ -283,7 +315,8 @@ bot.on('text', async (ctx) => {
     console.log('[scrape result]', JSON.stringify(result).slice(0, 800));
     clearInterval(interval);
     
-    if (result.status === false || !result.alight_creative_url && !result.xml_url) {
+    const parsed = classifyResult(result);
+    if (parsed.alight.length + parsed.xml.length + parsed.other.length === 0) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
         sent.message_id,
