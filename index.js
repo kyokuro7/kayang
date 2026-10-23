@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Telegraf, Markup, Scenes, session } = require('telegraf');
+const { Telegraf, Markup, session } = require('telegraf');
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -14,6 +14,8 @@ if (!BOT_TOKEN || !ADMIN_ID) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+
+bot.use(session());
 
 const loadingFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const loadingEmojis = ['🔍', '🔎', '🕵️', '🔍', '🔎', '🕵️'];
@@ -197,6 +199,7 @@ bot.action('find_preset', async (ctx) => {
 bot.action('back_menu', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
   await ctx.answerCbQuery();
+  ctx.session.waitingForUrl = false;
   await ctx.editMessageText(
     `<b>👋 Hai bosq! Selamat datang di AM Preset Bot</b>\n\n` +
     `Bot ini bisa cari preset Alight Motion dari link TikTok/YouTube.\n` +
@@ -291,7 +294,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.use(session());
 bot.launch().then(() => console.log('✅ Bot jalan...')).catch(console.error);
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
