@@ -1,10 +1,12 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { Telegraf, Markup, session } = require('telegraf');
 const axios = require('axios');
 const crypto = require('crypto');
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID;
+const clean = (v) => (v || '').trim().replace(/^["']|["']$/g, '');
+const BOT_TOKEN = clean(process.env.BOT_TOKEN);
+const ADMIN_ID = clean(process.env.ADMIN_ID);
 const BASE_URL = process.env.BASE_URL || 'https://amfinder.web.id';
 const DID = process.env.DID || '267f6fd3-34f4-4d9a-8d90-5aa28db8922b';
 
@@ -13,9 +15,15 @@ if (!BOT_TOKEN || !ADMIN_ID) {
   process.exit(1);
 }
 
+if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(BOT_TOKEN)) {
+  console.error('❌ Format BOT_TOKEN salah. Harus seperti 123456789:AAxxxxxxxx (tanpa spasi/kutip)');
+  process.exit(1);
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 
-bot.use(session());
+// session in-memory hilang saat restart -> beri default agar tidak error
+bot.use(session({ defaultSession: () => ({ waitingForUrl: false }) }));
 
 const loadingFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const loadingEmojis = ['🔍', '🔎', '🕵️', '🔍', '🔎', '🕵️'];
@@ -240,14 +248,15 @@ bot.action('profile', async (ctx) => {
 
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
-  if (!ctx.session.waitingForUrl) return;
-  
   const url = ctx.message.text.trim();
   const urlRegex = /(https?:\/\/[^\s]+)/;
   const match = url.match(urlRegex);
   
   if (!match) {
-    return ctx.reply('❌ Link tidak valid. Kirim link TikTok/YouTube yang benar.');
+    if (ctx.session.waitingForUrl) {
+      return ctx.reply('❌ Link tidak valid. Kirim link TikTok/YouTube yang benar.');
+    }
+    return; // bukan link & tidak sedang menunggu link
   }
   
   const targetUrl = match[0];
@@ -294,7 +303,18 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch().then(() => console.log('✅ Bot jalan...')).catch(console.error);
+bot.catch((err, ctx) => console.error('Bot error:', err));
+
+bot.telegram.getMe()
+  .then((me) => {
+    console.log(`✅ Token valid: @${me.username}`);
+    return bot.launch();
+  })
+  .catch((err) => {
+    console.error('❌ Gagal start bot:', err.message);
+    process.exit(1);
+  });
+console.log('⏳ Menghubungkan ke Telegram...');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
