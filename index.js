@@ -28,106 +28,120 @@ bot.use(session({ defaultSession: () => ({ waitingForUrl: false }) }));
 const loadingFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const loadingEmojis = ['🔍', '🔎', '🕵️', '🔍', '🔎', '🕵️'];
 
-async function computeProof(saltHex, messageStr, rounds) {
-  const saltBuffer = Buffer.from(saltHex, 'hex');
-  const key = await crypto.subtle.importKey(
-    'raw',
-    saltBuffer,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  let data = new TextEncoder().encode(messageStr);
-  const actualRounds = Math.max(1, Math.min(10000, Math.floor(rounds)));
-
-  for (let i = 0; i < actualRounds; i++) {
-    const signature = await crypto.subtle.sign('HMAC', key, data);
-    data = new Uint8Array(signature);
+// HMAC berantai (sama dengan crypto.subtle versi asli, tapi sync & jalan di semua versi Node)
+function computeProof(saltHex, messageStr, rounds) {
+  const salt = Buffer.from(saltHex, 'hex');
+  let data = Buffer.from(messageStr, 'utf8');
+  const n = Math.max(1, Math.min(10000, Math.floor(Number(rounds) || 1)));
+  for (let i = 0; i < n; i++) {
+    data = crypto.createHmac('sha256', salt).update(data).digest();
   }
-  return Array.from(data, byte => byte.toString(16).padStart(2, '0')).join('');
+  return data.toString('hex');
+}
+
+const escapeHtml = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+function apiError(error) {
+  if (error.response) {
+    let d = error.response.data;
+    if (d && typeof d.on === 'function') d = '(stream)';
+    if (typeof d !== 'string') { try { d = JSON.stringify(d); } catch (_) { d = String(d); } }
+    return `HTTP ${error.response.status}: ${String(d).slice(0, 300)}`;
+  }
+  return error.message;
+}
+
+// Parse blok SSE: "event: x\ndata: y\n\n"
+function parseSSE(raw) {
+  const events = [];
+  for (const block of raw.replace(/\r/g, '').split('\n\n')) {
+    let event = 'message';
+    const dataLines = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length) events.push({ event, data: dataLines.join('\n') });
+  }
+  return events;
+}
+
+async function scrapeOnce(targetUrl) {
+  const base = BASE_URL.replace(/\/+$/, '');
+  const headers = {
+    'Content-Type': 'application/json',
+    'Origin': base,
+    'Referer': `${base}/`,
+    'User-Agent': UA
+  };
+
+  const challengeRes = await axios.post(`${base}/api/v/2b51359f`, { did: DID }, { headers, timeout: 20000 });
+  const { cid, salt, ts, rounds } = challengeRes.data || {};
+  if (!cid || !salt) throw new Error('Challenge tidak valid: ' + JSON.stringify(challengeRes.data).slice(0, 200));
+
+  const proof = computeProof(salt, `${cid}|${DID}|${ts}`, rounds);
+
+  const verifyRes = await axios.post(`${base}/api/v/2b51359f`, {
+    cid, did: DID, ts, proof, score: 0, reasons: []
+  }, { headers, timeout: 20000 });
+
+  const token = verifyRes.data && verifyRes.data.token;
+  if (!token) throw new Error('Gagal mendapatkan token: ' + JSON.stringify(verifyRes.data).slice(0, 200));
+
+  const sseUrl = `${base}/api/find?url=${encodeURIComponent(targetUrl)}&bat=88&chg=0&t=${encodeURIComponent(token)}`;
+  const sseRes = await axios.get(sseUrl, {
+    responseType: 'stream',
+    headers: { 'Accept': 'text/event-stream', 'Referer': `${base}/`, 'User-Agent': UA }
+    // sengaja tanpa timeout axios: untuk stream, timeout dihitung per-koneksi & memutus SSE yang lama
+  });
+
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    let done = false;
+    const finish = (fn, val) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sseRes.data.destroy();
+      fn(val);
+    };
+    const timer = setTimeout(() => finish(reject, new Error('Timeout: server tidak mengirim hasil dalam 90 detik')), 90000);
+
+    const check = () => {
+      for (const ev of parseSSE(raw)) {
+        if (ev.event === 'result') {
+          try { return finish(resolve, JSON.parse(ev.data)); } catch (_) {}
+        }
+        if (ev.event === 'error') {
+          return finish(reject, new Error('Server: ' + ev.data.slice(0, 300)));
+        }
+      }
+    };
+
+    sseRes.data.on('data', (chunk) => { raw += chunk.toString(); check(); });
+    sseRes.data.on('end', () => {
+      check();
+      console.log('[SSE raw]', raw.slice(-1500));
+      finish(reject, new Error('Hasil SSE tidak ditemukan / gagal diparsing'));
+    });
+    sseRes.data.on('error', (err) => finish(reject, err));
+  });
 }
 
 async function scrapePreset(targetUrl) {
-  try {
-    const challengeRes = await axios.post(`${BASE_URL}/api/v/2b51359f`, { did: DID }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Origin': BASE_URL,
-        'Referer': `${BASE_URL}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 15000
-    });
-
-    const { cid, salt, ts, rounds } = challengeRes.data;
-    const messageToSign = `${cid}|${DID}|${ts}`;
-    const proof = await computeProof(salt, messageToSign, rounds);
-
-    const verifyRes = await axios.post(`${BASE_URL}/api/v/2b51359f`, {
-      cid, did: DID, ts, proof, score: 0, reasons: []
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Origin': BASE_URL,
-        'Referer': `${BASE_URL}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 15000
-    });
-
-    const token = verifyRes.data.token;
-    if (!token) throw new Error('Gagal mendapatkan token valid!');
-
-    const sseUrl = `${BASE_URL}/api/find?url=${encodeURIComponent(targetUrl)}&bat=88&chg=0&t=${encodeURIComponent(token)}`;
-    
-    const sseRes = await axios.get(sseUrl, {
-      responseType: 'stream',
-      headers: {
-        'Accept': 'text/event-stream',
-        'Referer': `${BASE_URL}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 30000
-    });
-
-    return new Promise((resolve, reject) => {
-      let rawData = '';
-      sseRes.data.on('data', (chunk) => {
-        rawData += chunk.toString();
-      });
-
-      sseRes.data.on('end', () => {
-        const lines = rawData.split('\n');
-        let currentEvent = '';
-        let finalJson = null;
-
-        for (let i = 0; i < lines.length; i++) {
-          let line = lines[i].trim();
-          if (line.startsWith('event:')) {
-            currentEvent = line.replace('event:', '').trim();
-          } else if (line.startsWith('data:')) {
-            let dataContent = line.replace('data:', '').trim();
-            if (currentEvent === 'result') {
-              try {
-                finalJson = JSON.parse(dataContent);
-              } catch (e) {}
-            }
-          }
-        }
-
-        if (finalJson) {
-          resolve(finalJson);
-        } else {
-          reject(new Error('Gagal memparsing hasil SSE'));
-        }
-      });
-
-      sseRes.data.on('error', (err) => reject(err));
-    });
-  } catch (error) {
-    throw new Error(error.response ? JSON.stringify(error.response.data) : error.message);
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await scrapeOnce(targetUrl);
+    } catch (error) {
+      lastErr = error;
+      console.error(`[scrape] percobaan ${attempt} gagal:`, apiError(error));
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 1500));
+    }
   }
+  throw new Error(apiError(lastErr));
 }
 
 function formatResult(data) {
@@ -266,6 +280,7 @@ bot.on('text', async (ctx) => {
   
   try {
     const result = await scrapePreset(targetUrl);
+    console.log('[scrape result]', JSON.stringify(result).slice(0, 800));
     clearInterval(interval);
     
     if (result.status === false || !result.alight_creative_url && !result.xml_url) {
@@ -274,8 +289,8 @@ bot.on('text', async (ctx) => {
         sent.message_id,
         null,
         `❌ <b>Preset tidak ditemukan</b>\n\n` +
-        `Link: ${targetUrl}\n` +
-        `Pesan: ${result.message || 'Tidak ada preset di link tersebut'}`,
+        `Link: ${escapeHtml(targetUrl)}\n` +
+        `Pesan: ${escapeHtml(result.message || 'Tidak ada preset di link tersebut')}`,
         { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🔄 Coba Lagi', 'find_preset'), Markup.button.callback('⬅️ Menu', 'back_menu')]]) }
       );
       return;
@@ -296,7 +311,7 @@ bot.on('text', async (ctx) => {
       sent.message_id,
       null,
       `❌ <b>Error saat scraping</b>\n\n` +
-      `<code>${error.message}</code>\n\n` +
+      `<code>${escapeHtml(error.message)}</code>\n\n` +
       `Coba link lain atau hubungi admin.`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🔄 Coba Lagi', 'find_preset'), Markup.button.callback('⬅️ Menu', 'back_menu')]]) }
     );
