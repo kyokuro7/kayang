@@ -605,6 +605,7 @@ const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🔍 Find Preset AM', 'find_preset')],
   [Markup.button.callback('📧 Temp Mail', 'tempmail'), Markup.button.callback('⭐ AM Premium', 'am_premium')],
   [Markup.button.callback('🤖 AI Chat', 'ai_chat'), Markup.button.callback('🎮 Fake ML', 'fake_ml')],
+  [Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
 
@@ -669,6 +670,7 @@ bot.action('help', async (ctx) => {
     `<b>🎵 /play</b> &lt;judul/url&gt;: cari lagu YouTube dan kirim audionya.\n` +
     `<b>📦 /terabox</b> &lt;link&gt;: ambil link download HD &amp; stream dari file Terabox.\n` +
     `<b>📸 /ig</b> &lt;link&gt;: download foto/video/reel Instagram (otomatis deteksi, HD jika tersedia).\n` +
+    `<b>📱 /nomor</b> [negara]: daftar nomor virtual publik per negara (contoh: <code>/nomor indonesia</code>).\n` +
     `<b>🎨 /imagine</b> &lt;prompt&gt; | &lt;negative&gt;: buat gambar dari teks (khusus SFW, butuh <code>npm i crypto-js</code>).\n` +
     `<b>🖼 /hd</b>: reply sebuah foto dengan /hd untuk di-upscale jadi HD.\n` +
     `<b>🎮 Fake ML</b>: buat kartu profil Mobile Legends palsu (username, avatar, rank, border).\n` +
@@ -1358,6 +1360,109 @@ bot.command(['ig', 'instagram', 'igdl'], async (ctx) => {
     await ctx.reply('❌ Gagal mengambil media Instagram.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
   }
 });
+
+// ================= /nomor (nomor virtual, synoxcloud) =================
+const VN_API = process.env.VN_API || 'https://api.synoxcloud.xyz/tools/virtual-numbers';
+const VN_KEY = process.env.VN_APIKEY || 'FREE';
+const VN_TTL = 10 * 60 * 1000; // cache daftar nomor 10 menit (responsnya besar, ±14.000 nomor)
+const VN_PAGE_SIZE = 12;       // negara per halaman
+const VN_SHOW = 10;            // nomor yang ditampilkan per negara
+let vnCache = { at: 0, total: 0, countries: [] };
+
+async function loadVirtualNumbers() {
+  if (vnCache.countries.length && Date.now() - vnCache.at < VN_TTL) return vnCache;
+  const { data } = await axios.get(VN_API, { params: { apikey: VN_KEY }, timeout: 60000 });
+  const list = data && data.result && data.result.numbers;
+  if (!data || !data.status || !Array.isArray(list) || !list.length) {
+    console.log('[vnum raw]', JSON.stringify(data).slice(0, 300));
+    throw new Error((data && (data.message || data.error)) || 'Daftar nomor kosong');
+  }
+  const map = new Map();
+  for (const n of list) {
+    if (!n || !n.number) continue;
+    const name = n.country || 'Unknown';
+    if (!map.has(name)) map.set(name, { name, flag: n.flag || '🏳️', code: n.countryCode || '', numbers: [] });
+    map.get(name).numbers.push(String(n.number));
+  }
+  const countries = [...map.values()].sort((a, b) => b.numbers.length - a.numbers.length || a.name.localeCompare(b.name));
+  vnCache = { at: Date.now(), total: list.length, countries };
+  return vnCache;
+}
+
+function vnMenuView(cache, page) {
+  const pages = Math.max(1, Math.ceil(cache.countries.length / VN_PAGE_SIZE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const slice = cache.countries.slice(page * VN_PAGE_SIZE, (page + 1) * VN_PAGE_SIZE);
+  const rows = [];
+  for (let i = 0; i < slice.length; i += 2) {
+    rows.push(slice.slice(i, i + 2).map((c, j) =>
+      Markup.button.callback(`${c.flag} ${c.name} (${c.numbers.length})`.slice(0, 40), `vn_c:${page * VN_PAGE_SIZE + i + j}`)));
+  }
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback('⬅️ Prev', `vn_p:${page - 1}`));
+  nav.push(Markup.button.callback(`${page + 1}/${pages}`, `vn_p:${page}`));
+  if (page < pages - 1) nav.push(Markup.button.callback('Next ➡️', `vn_p:${page + 1}`));
+  rows.push(nav);
+  rows.push([Markup.button.callback('⬅️ Menu', 'back_menu')]);
+  return {
+    text: `<b>📱 Nomor Virtual</b>\n${cache.total.toLocaleString('id-ID')} nomor dari ${cache.countries.length} negara.\nPilih negara:\n\n` +
+      `<i>Ini nomor publik: siapa pun bisa melihat SMS yang masuk, jadi jangan dipakai untuk akun penting.</i>`,
+    kb: Markup.inlineKeyboard(rows)
+  };
+}
+
+function vnCountryView(cache, idx) {
+  const c = cache.countries[idx];
+  if (!c) return null;
+  const pool = [...c.numbers];
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  const picks = pool.slice(0, VN_SHOW);
+  const body = picks.map((n, i) => `${i + 1}. <code>+${escapeHtml(n)}</code>`).join('\n');
+  return {
+    text: `<b>${c.flag} ${escapeHtml(c.name)}</b>${c.code ? ` (+${escapeHtml(c.code)})` : ''}\n${c.numbers.length} nomor tersedia, ${picks.length} acak:\n\n${body}\n\n<i>Ketuk nomor untuk menyalin.</i>`,
+    kb: Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Acak lagi', `vn_c:${idx}`)],
+      [Markup.button.callback('⬅️ Negara', `vn_p:${Math.floor(idx / VN_PAGE_SIZE)}`), Markup.button.callback('🏠 Menu', 'back_menu')]
+    ])
+  };
+}
+
+bot.command(['nomor', 'vnum', 'virtualnumber'], async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const q = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim().toLowerCase();
+  const wait = await ctx.reply('⏳ Mengambil daftar nomor...');
+  try {
+    const cache = await loadVirtualNumbers();
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+    let view = null;
+    if (q) {
+      const idx = cache.countries.findIndex((c) => c.name.toLowerCase() === q || c.name.toLowerCase().includes(q) || c.code === q.replace('+', ''));
+      if (idx >= 0) view = vnCountryView(cache, idx);
+      else await ctx.reply(`❌ Negara "${q}" tidak ditemukan, pilih dari daftar:`);
+    }
+    if (!view) view = vnMenuView(cache, 0);
+    await ctx.reply(view.text, { parse_mode: 'HTML', ...view.kb });
+  } catch (e) {
+    console.error('[vnum]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Gagal mengambil nomor.\n' + apiError(e).slice(0, 200)).catch(() => {});
+  }
+});
+
+async function vnAction(ctx, build) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  try {
+    const cache = await loadVirtualNumbers();
+    const view = build(cache) || vnMenuView(cache, 0);
+    await ctx.answerCbQuery();
+    await safeEdit(ctx, view.text, view.kb);
+  } catch (e) {
+    console.error('[vnum action]', apiError(e));
+    await ctx.answerCbQuery('❌ Gagal memuat').catch(() => {});
+  }
+}
+bot.action('vn_menu', (ctx) => vnAction(ctx, (cache) => vnMenuView(cache, 0)));
+bot.action(/^vn_p:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnMenuView(cache, Number(ctx.match[1]))));
+bot.action(/^vn_c:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnCountryView(cache, Number(ctx.match[1]))));
 
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
