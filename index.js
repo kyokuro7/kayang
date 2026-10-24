@@ -214,74 +214,87 @@ async function showLoadingAnimation(ctx, text = 'Sedang mencari preset...') {
   return { sent, interval };
 }
 
-// ================= TEMP MAIL (temp-mail.app) =================
-const TEMPMAIL_URL = 'https://temp-mail.app';
+// ================= TEMP MAIL (Guerrilla Mail API) =================
+// Dokumentasi resmi: https://www.guerrillamail.com/GuerrillaMailAPI.html
+const GM_URL = 'https://api.guerrillamail.com/ajax.php';
 let cheerio = null;
 try { cheerio = require('cheerio'); } catch (_) { /* opsional: npm i cheerio */ }
 
 function newTempSession() {
-  return { visitorId: crypto.randomUUID(), cookies: {}, email: null };
-}
-
-async function tempApi(sess, apiPath, params = {}) {
-  const cookie = Object.entries(sess.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
-  const res = await axios.get(`${TEMPMAIL_URL}${apiPath}`, {
-    params,
-    headers: {
-      'Accept': '*/*',
-      'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36',
-      'Cache-Control': 'no-cache',
-      'Visitor-Id': sess.visitorId,
-      ...(cookie ? { Cookie: cookie } : {})
-    },
-    timeout: 20000
-  });
-  for (const c of res.headers['set-cookie'] || []) {
-    const [pair] = c.split(';');
-    const i = pair.indexOf('=');
-    if (i > 0) sess.cookies[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
-  }
-  let data = res.data;
-  if (typeof data === 'string') { try { data = JSON.parse(data); } catch (_) { throw new Error('Respon temp-mail bukan JSON'); } }
-  return data;
+  return { email: null, sid: null, waiting: false };
 }
 
 function parseEmailContent(html) {
   if (!html) return { text: '', links: [] };
+  let text = '';
+  let links = [];
   if (cheerio) {
     const $ = cheerio.load(html);
-    const links = [];
     $('a[href]').each((i, el) => {
       const href = $(el).attr('href');
       if (href && /^https?:\/\//i.test(href)) links.push(href);
     });
     $('script, style').remove();
-    return { text: $('body').text().replace(/\n\s*\n/g, '\n').trim(), links };
+    text = $('body').text().replace(/\n\s*\n/g, '\n').trim();
+  } else {
+    links = [...html.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)].map((m) => m[1]);
+    text = html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   }
-  // fallback tanpa cheerio
-  const links = [...html.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)].map((m) => m[1]);
-  const text = html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  return { text, links };
+  // email teks biasa: ambil URL dari teksnya juga
+  links = links.concat(text.match(/https?:\/\/[^\s"'<>)]+/g) || []);
+  return { text, links: [...new Set(links)] };
+}
+
+async function gmCall(sess, fn, extra = {}) {
+  const params = { f: fn, ip: '127.0.0.1', agent: 'Mozilla/5.0', ...extra };
+  if (sess.sid) params.sid_token = sess.sid;
+  const res = await axios.get(GM_URL, { params, timeout: 20000 });
+  if (!res.data || typeof res.data !== 'object') throw new Error('Respon Guerrilla Mail tidak valid');
+  return res.data;
 }
 
 async function tempCreate(sess) {
-  const r = await tempApi(sess, '/api/mail/address', { refresh: 'true', expire: '1440', part: 'main' });
-  if (!r || !r.address) throw new Error('Gagal generate email');
-  sess.email = r.address;
-  return r.address;
+  sess.sid = null;
+  const r = await gmCall(sess, 'get_email_address', { lang: 'en' });
+  if (!r.email_addr || !r.sid_token) throw new Error('Gagal membuat email: ' + JSON.stringify(r).slice(0, 200));
+  sess.email = r.email_addr;
+  sess.sid = r.sid_token;
+  return r.email_addr;
 }
 
 async function tempInbox(sess) {
-  const r = await tempApi(sess, '/api/mail/list', { part: 'main' });
-  return (r && r.message) || [];
+  const r = await gmCall(sess, 'check_email', { seq: 0 });
+  // pesan sambutan otomatis dari Guerrilla Mail tidak ditampilkan
+  const items = (r.list || []).filter((m) => !/^no-reply@guerrillamail\.com$/i.test(m.mail_from || ''));
+
+  const messages = await Promise.all(items.slice(0, 5).map(async (m) => {
+    let detail = m;
+    try { detail = await gmCall(sess, 'fetch_email', { email_id: m.mail_id }); } catch (_) {}
+    return {
+      id: m.mail_id,
+      subject: detail.mail_subject || m.mail_subject,
+      fromName: detail.mail_from || m.mail_from || '-',
+      date: m.mail_timestamp,
+      content: detail.mail_body || m.mail_excerpt || ''
+    };
+  }));
+
+  const raw = { provider: 'guerrillamail', total: items.length, count: r.count };
+  if (!messages.length) console.log('[tempmail raw]', sess.email, JSON.stringify(raw));
+  return { messages, raw };
 }
 
-function formatInbox(email, messages) {
+function formatInbox(email, messages, raw) {
   let msg = `<b>📧 Temp Mail</b>\n<code>${escapeHtml(email)}</code>\n\n`;
-  if (!messages.length) return msg + '📭 Inbox masih kosong. Tekan <b>Cek Inbox</b> lagi beberapa detik lagi.';
+  if (!messages.length) {
+    let dbg = '';
+    try { dbg = JSON.stringify(raw); } catch (_) {}
+    return msg + '📭 Inbox masih kosong.\n\nKalau email baru dikirim, tunggu 10–30 detik lalu tekan <b>Cek Inbox</b> lagi, atau pakai <b>Tunggu otomatis</b>.' +
+      (dbg ? `\n\n<i>Respon server:</i> <code>${escapeHtml(dbg.slice(0, 200))}</code>` : '');
+  }
   msg += `📬 <b>${messages.length} email masuk</b>\n`;
   for (const m of messages.slice(0, 5)) {
-    const { text, links } = parseEmailContent(m.content);
+    const { text, links } = parseEmailContent(m.content || m.html || m.body || m.text || m.preview || '');
     msg += `\n━━━━━━━━━━\n<b>${escapeHtml(m.subject || '(tanpa subjek)')}</b>\n`;
     msg += `Dari: ${escapeHtml(m.fromName || m.fromAddress || '-')}\n`;
     if (text) msg += `${escapeHtml(text.slice(0, 250))}${text.length > 250 ? '…' : ''}\n`;
@@ -294,8 +307,8 @@ function formatInbox(email, messages) {
 }
 
 const tempKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('📥 Cek Inbox', 'tm_check'), Markup.button.callback('🆕 Email Baru', 'tm_new')],
-  [Markup.button.callback('⬅️ Menu', 'back_menu')]
+  [Markup.button.callback('📥 Cek Inbox', 'tm_check'), Markup.button.callback('⏳ Tunggu otomatis', 'tm_wait')],
+  [Markup.button.callback('🆕 Email Baru', 'tm_new'), Markup.button.callback('⬅️ Menu', 'back_menu')]
 ]);
 
 // edit pesan, abaikan error "message is not modified"
@@ -600,8 +613,8 @@ bot.action('tm_check', async (ctx) => {
   }
   await ctx.answerCbQuery('Mengecek inbox...');
   try {
-    const messages = await tempInbox(sess);
-    await safeEdit(ctx, formatInbox(sess.email, messages), tempKeyboard);
+    const { messages, raw } = await tempInbox(sess);
+    await safeEdit(ctx, formatInbox(sess.email, messages, raw), tempKeyboard);
   } catch (e) {
     console.error('[tm_check]', apiError(e));
     await safeEdit(ctx, `❌ <b>Gagal cek inbox</b>\n\n<code>${escapeHtml(apiError(e))}</code>`, tempKeyboard);
@@ -684,6 +697,40 @@ bot.action(/^fml_b_(\d+)$/, async (ctx) => {
       `❌ <b>Gagal membuat gambar</b>\n\n<code>${escapeHtml(apiError(e).slice(0, 500))}</code>`,
       Markup.inlineKeyboard([[Markup.button.callback('🔄 Pilih Ulang', 'fml_again'), Markup.button.callback('⬅️ Menu', 'back_menu')]]));
   }
+});
+
+bot.action('tm_wait', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  const sess = ctx.session.temp;
+  if (!sess || !sess.email) return ctx.answerCbQuery('Buat email dulu');
+  if (sess.waiting) return ctx.answerCbQuery('Masih menunggu...');
+  await ctx.answerCbQuery('Menunggu email masuk...');
+  sess.waiting = true;
+
+  // jalan di background (tanpa await) supaya handler lain tidak ikut tertahan
+  (async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const TOTAL = 20;
+    let last = { messages: [], raw: null };
+    try {
+      for (let i = 1; i <= TOTAL; i++) {
+        try { last = await tempInbox(sess); } catch (e) { console.error('[tm_wait]', apiError(e)); }
+        if (last.messages.length) {
+          await safeEdit(ctx, formatInbox(sess.email, last.messages, last.raw), tempKeyboard);
+          return;
+        }
+        if (i % 3 === 1) {
+          await safeEdit(ctx, `<b>📧 Temp Mail</b>\n<code>${escapeHtml(sess.email)}</code>\n\n⏳ Menunggu email masuk... (${i}/${TOTAL})`, tempKeyboard).catch(() => {});
+        }
+        await sleep(3000);
+      }
+      await safeEdit(ctx, formatInbox(sess.email, [], last.raw), tempKeyboard);
+    } catch (e) {
+      console.error('[tm_wait]', e.message);
+    } finally {
+      sess.waiting = false;
+    }
+  })();
 });
 
 bot.action('am_premium', async (ctx) => {
