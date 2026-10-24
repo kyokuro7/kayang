@@ -397,7 +397,172 @@ function chunkText(t, size = 4000) {
   return out;
 }
 
-const aiKeyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+// ---------- AI Chat: backend heck.ai (dengan session / ingat obrolan) ----------
+const HECK_BASE = process.env.HECK_BASE || 'https://api.heckai.weight-wave.com/api/ha/v1';
+const HECK_MODEL = process.env.HECK_MODEL || 'openai/gpt-5.4-mini';
+const HECK_LANG = process.env.HECK_LANG || 'English';
+const HECK_HEADERS = {
+  'Content-Type': 'application/json',
+  'Origin': 'https://heck.ai',
+  'Referer': 'https://heck.ai/',
+  'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36',
+  'Accept': '*/*'
+};
+
+async function heckCreateSession(title) {
+  const res = await axios.post(`${HECK_BASE}/session/create`,
+    { title: String(title || 'Chat').slice(0, 60) }, { headers: HECK_HEADERS, timeout: 20000 });
+  const id = res.data && res.data.id;
+  if (!id) throw new Error('Session ID kosong dari heck.ai');
+  return id;
+}
+
+// parse stream SSE heck.ai -> teks jawaban (tanpa penanda & tanpa "related questions")
+function parseHeckStream(raw) {
+  raw = String(raw).replace(/\r/g, '');
+  // per spec SSE: event dipisah baris kosong, baris data dalam 1 event digabung dengan "\n"
+  const events = raw.includes('\n\n') ? raw.split('\n\n') : raw.split('\n');
+  let text = '';
+  let inRelated = false;
+  for (const ev of events) {
+    const dataLines = ev.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.replace(/^data:\s?/, ''));
+    if (!dataLines.length) continue;
+    const content = dataLines.join('\n');
+    if (content.includes('[RELATE_Q_START]')) { inRelated = true; continue; }
+    if (content.includes('[RELATE_Q_DONE]')) { inRelated = false; continue; }
+    if (content.includes('[ANSWER_START]') || content.includes('[ANSWER_DONE]')) continue;
+    if (!inRelated) text += content;
+  }
+  return text.trim();
+}
+
+async function askHeck(session, question, rawPrompt) {
+  if (!session.heckId) session.heckId = await heckCreateSession(rawPrompt);
+  const prev = session.heckPrev || {};
+  const res = await axios.post(`${HECK_BASE}/chat`, {
+    model: HECK_MODEL,
+    question,
+    language: HECK_LANG,
+    previousQuestion: prev.q || null,
+    previousAnswer: prev.a || null,
+    sessionId: session.heckId
+  }, { headers: HECK_HEADERS, responseType: 'text', timeout: 120000, transformResponse: [(d) => d] });
+
+  const answer = parseHeckStream(res.data);
+  if (!answer) {
+    console.log('[heck raw]', String(res.data).slice(0, 500));
+    throw new Error('Jawaban kosong dari heck.ai');
+  }
+  session.heckPrev = { q: rawPrompt.slice(0, 2000), a: answer.slice(0, 4000) };
+  return answer;
+}
+
+// heck.ai dulu (ingat obrolan); kalau gagal & AI_APIKEY ada -> fallback ke Ministral (tanpa memori)
+async function askAiSmart(session, question, rawPrompt) {
+  try {
+    return await askHeck(session, question, rawPrompt);
+  } catch (e) {
+    console.error('[heck]', apiError(e));
+    session.heckId = null; // session mungkin kedaluwarsa -> buat baru di pesan berikutnya
+    if (!AI_APIKEY) throw e;
+    return askAI(question);
+  }
+}
+
+const aiKeyboard = Markup.inlineKeyboard([[Markup.button.callback('🆕 Chat Baru', 'ai_new'), Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+
+// ---------- AI Chat: kirim kode sebagai file ----------
+const LANG_EXT = {
+  javascript: 'js', js: 'js', node: 'js', nodejs: 'js', jsx: 'jsx', typescript: 'ts', ts: 'ts', tsx: 'tsx',
+  css: 'css', scss: 'scss', html: 'html', xml: 'xml', json: 'json', yaml: 'yml', yml: 'yml', md: 'md', markdown: 'md',
+  python: 'py', py: 'py', php: 'php', java: 'java', kotlin: 'kt', c: 'c', cpp: 'cpp', 'c++': 'cpp', csharp: 'cs', cs: 'cs',
+  go: 'go', rust: 'rs', ruby: 'rb', swift: 'swift', sql: 'sql', bash: 'sh', sh: 'sh', shell: 'sh', zsh: 'sh',
+  powershell: 'ps1', lua: 'lua', dart: 'dart', vue: 'vue', svelte: 'svelte', ini: 'ini', toml: 'toml',
+  env: 'env', dockerfile: 'Dockerfile', txt: 'txt', text: 'txt', plaintext: 'txt'
+};
+const FILE_INTENT_RE = /\b(buat(?:kan|in)?|bikin(?:kan)?|create|generate|tulis(?:kan)?|write|coding|kode|code|script|file|html|css|javascript|python|php)\b/i;
+const FILE_INSTRUCTION =
+  'Jika kamu diminta membuat kode, tulis setiap file dalam blok kode terpisah dengan format ```bahasa:namafile.ext ' +
+  '(contoh: ```js:index.js atau ```css:style.css). Satu blok = satu file utuh. Jelaskan singkat di luar blok kode.\n\n';
+
+function safeFilename(name) {
+  return String(name || '').replace(/\\/g, '/').split('/').pop().replace(/[^\w.\-]+/g, '_').replace(/^\.+/, '').slice(0, 80);
+}
+
+// ambil blok ```lang:nama.ext ... ``` dari jawaban AI
+function extractCodeFiles(answer) {
+  const files = [];
+  const used = new Set();
+  const re = /```[ \t]*([^\n`]*)\n([\s\S]*?)```/g;
+  let text = '';
+  let last = 0;
+  let m;
+  let idx = 0;
+  while ((m = re.exec(answer))) {
+    const info = m[1].trim();
+    let code = m[2].replace(/\s+$/, '');
+    if (!code.trim()) continue;
+    idx++;
+
+    let lang = '';
+    let name = '';
+    const parts = info.split(/[\s:]+/).filter(Boolean);
+    for (const part of parts) {
+      if (/\.[A-Za-z0-9]{1,10}$/.test(part) || /^(Dockerfile|Makefile)$/i.test(part)) name = safeFilename(part);
+      else if (!lang) lang = part.toLowerCase();
+    }
+    // nama file dari komentar baris pertama: // index.js, /* style.css */, <!-- index.html -->, # app.py
+    if (!name) {
+      const first = code.split('\n')[0];
+      const c = first.match(/^\s*(?:\/\/|#|\/\*|<!--|--)\s*(?:file(?:name)?\s*:?\s*)?([\w\-./]+\.[A-Za-z0-9]{1,10})\s*(?:\*\/|-->)?\s*$/i);
+      if (c) name = safeFilename(c[1]);
+    }
+    if (!name) {
+      const ext = LANG_EXT[lang] || (lang && /^[a-z0-9]{1,6}$/.test(lang) ? lang : 'txt');
+      name = ext === 'Dockerfile' ? 'Dockerfile' : `kode-${idx}.${ext}`;
+    }
+    if (!name) name = `kode-${idx}.txt`;
+    while (used.has(name.toLowerCase())) {
+      const dot = name.lastIndexOf('.');
+      name = dot > 0 ? `${name.slice(0, dot)}-${idx}${name.slice(dot)}` : `${name}-${idx}`;
+    }
+    used.add(name.toLowerCase());
+
+    files.push({ name, code, lines: code.split('\n').length });
+    text += answer.slice(last, m.index) + `📎 ${name}`;
+    last = m.index + m[0].length;
+  }
+  text += answer.slice(last);
+  return { files, text: text.trim() };
+}
+
+// kirim jawaban AI: teks biasa + file untuk blok kode
+async function sendAiAnswer(ctx, prompt, answer) {
+  const { files, text } = extractCodeFiles(answer);
+  const asFiles = files.length > 0 && (FILE_INTENT_RE.test(prompt) || files.some((f) => f.lines >= 15));
+
+  if (!asFiles) {
+    const parts = chunkText(answer);
+    for (let i = 0; i < parts.length; i++) {
+      await ctx.reply(parts[i], i === parts.length - 1 ? aiKeyboard : undefined);
+    }
+    return;
+  }
+
+  if (text) {
+    for (const part of chunkText(text)) await ctx.reply(part);
+  }
+  await ctx.sendChatAction('upload_document').catch(() => {});
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const isLast = i === files.length - 1;
+    await ctx.replyWithDocument(
+      { source: Buffer.from(f.code, 'utf8'), filename: f.name },
+      { caption: `📄 ${f.name} (${f.lines} baris)`, ...(isLast ? aiKeyboard : {}) }
+    );
+  }
+}
+
 
 // ================= FAKE ML (kyzznekoo canvas) =================
 const FML_URL = process.env.FML_URL || 'https://app.kyzznekoo.my.id/api/canvas/fakeml';
@@ -552,6 +717,11 @@ bot.action('help', async (ctx) => {
     `• TikTok: vt.tiktok.com, tiktok.com\n` +
     `• YouTube: youtu.be, youtube.com\n\n` +
     `<b>📧 Temp Mail</b>: buat email sementara & baca inbox-nya.\n` +
+    `<b>🎵 /play</b> &lt;judul/url&gt;: cari lagu YouTube dan kirim audionya.\n` +
+    `<b>🎧 /spotify</b> &lt;judul/link&gt;: cari lagu Spotify dan kirim audionya (alias: /spotifyplay, /spotifydl).\n` +
+    `<b>📦 /terabox</b> &lt;link&gt;: ambil link download HD &amp; stream dari file Terabox.\n` +
+    `<b>🎨 /imagine</b> &lt;prompt&gt; | &lt;negative&gt;: buat gambar dari teks (khusus SFW, butuh <code>npm i crypto-js</code>).\n` +
+    `<b>🖼 /hd</b>: reply sebuah foto dengan /hd untuk di-upscale jadi HD.\n` +
     `<b>🎮 Fake ML</b>: buat kartu profil Mobile Legends palsu (username, avatar, rank, border).\n` +
     `<b>🤖 AI Chat</b>: ngobrol dengan AI, tiap pesan dijawab (tanpa memori percakapan).\n` +
     `<b>⭐ AM Premium</b>: login Satriam lewat magic link (kirim email → tempel link dari inbox).\n\n` +
@@ -621,16 +791,28 @@ bot.action('tm_check', async (ctx) => {
   }
 });
 
+const aiIntro = () =>
+  `<b>🤖 AI Chat</b> (${escapeHtml(HECK_MODEL.split('/').pop())})\n\nKirim pertanyaan/prompt apa saja, nanti dijawab AI.\n` +
+  `Minta dibuatkan kode (mis. "buatkan landing page html css js") dan hasilnya dikirim sebagai file.\n` +
+  `AI <b>ingat obrolan</b> selama sesi berjalan. Tekan <b>Chat Baru</b> untuk mulai dari nol, atau <b>Menu</b> untuk keluar.`;
+
 bot.action('ai_chat', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
   await ctx.answerCbQuery();
   ctx.session.waitingForUrl = false;
   ctx.session.step = 'ai_chat';
-  await safeEdit(ctx,
-    `<b>🤖 AI Chat</b> (Ministral 8B)\n\nKirim pertanyaan/prompt apa saja, nanti dijawab AI.\n` +
-    `Tiap pesan berdiri sendiri (tidak ingat obrolan sebelumnya). Tekan <b>Menu</b> untuk keluar.` +
-    (AI_APIKEY ? '' : `\n\n⚠️ <b>AI_APIKEY</b> belum diisi di .env`),
-    aiKeyboard);
+  ctx.session.heckId = null;
+  ctx.session.heckPrev = null;
+  await safeEdit(ctx, aiIntro(), aiKeyboard);
+});
+
+bot.action('ai_new', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  ctx.session.step = 'ai_chat';
+  ctx.session.heckId = null;
+  ctx.session.heckPrev = null;
+  await ctx.answerCbQuery('🆕 Obrolan baru dimulai');
+  await ctx.reply('🆕 Obrolan baru dimulai. Silakan kirim pertanyaan.', aiKeyboard);
 });
 
 bot.action('fake_ml', async (ctx) => {
@@ -744,6 +926,435 @@ bot.action('am_premium', async (ctx) => {
     cancelKeyboard);
 });
 
+// ================= /hd (UPSCALE FOTO) =================
+const UPSCALE_API = process.env.UPSCALE_API || 'https://api.ikyyxd.my.id/tools/upscale';
+
+// Link file Telegram berisi TOKEN BOT, jadi tidak boleh dikirim ke API pihak lain.
+// Foto diunduh di sini, lalu diunggah sementara (1 jam) ke litterbox untuk dapat URL publik.
+async function tgFileToBuffer(ctx, fileId) {
+  const link = await ctx.telegram.getFileLink(fileId);
+  const res = await axios.get(link.href, { responseType: 'arraybuffer', timeout: 60000 });
+  return Buffer.from(res.data);
+}
+
+async function uploadTemp(buffer, filename = 'image.jpg') {
+  const form = new FormData();
+  form.append('reqtype', 'fileupload');
+  form.append('time', '1h');
+  form.append('fileToUpload', new Blob([buffer]), filename);
+  const res = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
+    method: 'POST',
+    body: form,
+    signal: AbortSignal.timeout(60000)
+  });
+  const url = (await res.text()).trim();
+  if (!/^https?:\/\//i.test(url)) throw new Error('Upload sementara gagal: ' + url.slice(0, 100));
+  return url;
+}
+
+bot.command('hd', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const q = ctx.message.reply_to_message;
+  const fileId = q && (
+    (q.photo && q.photo[q.photo.length - 1].file_id) ||
+    (q.document && /^image\//i.test(q.document.mime_type || '') && q.document.file_id)
+  );
+  if (!fileId) return ctx.reply('❌ Reply foto yang mau dibikin HD dengan perintah /hd');
+
+  const wait = await ctx.reply('⏳ Tunggu sebentar...');
+  try {
+    const buf = await tgFileToBuffer(ctx, fileId);
+    const publicUrl = await uploadTemp(buf);
+    const res = await axios.get(UPSCALE_API, { params: { url: publicUrl }, timeout: 120000 });
+    const r = res.data && res.data.result;
+    if (!(res.data && res.data.status && r && r.image)) {
+      console.log('[hd raw]', JSON.stringify(res.data).slice(0, 500));
+      throw new Error('API tidak mengembalikan gambar');
+    }
+    const extra = {
+      caption: `✅ <b>Berhasil di-upscale!</b>${r.size ? `\n📦 <b>Size</b>: ${escapeHtml(r.size)}` : ''}`,
+      parse_mode: 'HTML',
+      reply_to_message_id: ctx.message.message_id
+    };
+    try {
+      await ctx.replyWithPhoto(r.image, extra);
+    } catch (e) {
+      // foto terlalu besar untuk dikirim sebagai photo -> kirim sebagai file
+      await ctx.replyWithDocument(r.image, extra);
+    }
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+  } catch (e) {
+    console.error('[hd]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Terjadi kesalahan: ' + apiError(e).slice(0, 300)).catch(() => {});
+  }
+});
+
+// ================= /play (YouTube audio) =================
+const PLAY_API = process.env.PLAY_API || 'https://api.ikyyxd.my.id/search/ytplayv2';
+
+const fmtDuration = (sec) => {
+  sec = Math.max(0, Math.floor(Number(sec) || 0));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+};
+
+bot.command('play', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const query = ctx.message.text.replace(/^\/play(@\w+)?\s*/i, '').trim();
+  if (!query) return ctx.reply('Masukkan judul/url setelah /play\nContoh: /play dewa 19 kangen');
+
+  const wait = await ctx.reply('🔎 Mencari lagu...');
+  try {
+    const { data } = await axios.get(PLAY_API, { params: { q: query }, timeout: 90000 });
+    const res = data && data.result;
+    const audioUrl = res && res.audio && res.audio.url;
+    if (!data || !data.status || !audioUrl) {
+      console.log('[play raw]', JSON.stringify(data).slice(0, 500));
+      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Lagu tidak ditemukan').catch(() => {});
+    }
+
+    const title = String(res.title || query);
+    const caption = `🎵 ${title}\n⏱️ ${fmtDuration(res.duration)}${res.source ? `\n🔗 ${res.source}` : ''}`.slice(0, 1000);
+
+    await ctx.sendChatAction('upload_voice').catch(() => {});
+    if (res.thumbnail) {
+      await ctx.replyWithPhoto(res.thumbnail, { caption }).catch((e) => console.error('[play thumb]', e.message));
+    }
+
+    const opts = { title: title.slice(0, 100), duration: Math.floor(Number(res.duration) || 0) || undefined };
+    try {
+      await ctx.replyWithAudio(audioUrl, opts);
+    } catch (e) {
+      // Telegram gagal mengambil URL (file besar / server sumber menolak) -> unduh sendiri lalu upload
+      console.error('[play url gagal, coba upload manual]', e.message);
+      const dl = await axios.get(audioUrl, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
+      const filename = title.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'audio';
+      await ctx.replyWithAudio({ source: Buffer.from(dl.data), filename: `${filename}.mp3` }, opts);
+    }
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+  } catch (e) {
+    console.error('[play]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Gagal memproses, coba lagi nanti.\n' + apiError(e).slice(0, 200)).catch(() => {});
+  }
+});
+
+// ================= /spotify (spotifyplay, spotifydl) =================
+const SPOTIFY_API = process.env.SPOTIFY_API || 'https://api.ikyyxd.my.id/search/spotifyplay';
+
+bot.command(['spotifyplay', 'spotifydl', 'spotify'], async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const query = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+  const replyOpt = { reply_to_message_id: ctx.message.message_id };
+  if (!query) {
+    return ctx.reply(
+      '⚠️ Masukkan judul atau link Spotify!\nContoh:\n/spotifyplay denok\n/spotifyplay https://open.spotify.com/track/xxx',
+      replyOpt
+    );
+  }
+
+  const wait = await ctx.reply('⏳ Mengambil data Spotify...', replyOpt);
+  const removeWait = () => ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
+  try {
+    const { data } = await axios.get(SPOTIFY_API, { params: { query }, timeout: 90000 });
+    const res = data && data.result;
+    if (!data || !data.status || !res) {
+      console.log('[spotify raw]', JSON.stringify(data).slice(0, 500));
+      await removeWait();
+      return ctx.reply('❌ Lagu tidak ditemukan', replyOpt);
+    }
+
+    const title = String(res.title || 'Unknown');
+    const artist = String(res.artist || 'Unknown');
+    const album = String(res.album || 'Unknown');
+    // duration bisa berupa detik (angka) atau teks "3:45"
+    const durRaw = res.duration;
+    const durSec = Number(durRaw);
+    const duration = durRaw == null || durRaw === '' ? '-' : (Number.isFinite(durSec) ? fmtDuration(durSec) : String(durRaw));
+    const audioUrl = res.download;
+
+    if (!audioUrl || !/^https?:\/\//i.test(audioUrl)) {
+      await removeWait();
+      return ctx.reply('❌ Link download tidak tersedia!', replyOpt);
+    }
+
+    const caption = `🎵 ${title}\n👤 Artist: ${artist}\n💿 Album: ${album}\n⏱️ Durasi: ${duration}\n🎧 Source: Spotify`.slice(0, 1000);
+
+    await removeWait();
+    await ctx.sendChatAction('upload_voice').catch(() => {});
+    if (res.thumbnail) {
+      await ctx.replyWithPhoto(res.thumbnail, { caption, ...replyOpt }).catch((e) => {
+        console.error('[spotify thumb]', e.message);
+        return ctx.reply(caption, replyOpt).catch(() => {});
+      });
+    } else {
+      await ctx.reply(caption, replyOpt).catch(() => {});
+    }
+
+    const opts = {
+      title: title.slice(0, 100),
+      performer: artist.slice(0, 100),
+      reply_to_message_id: ctx.message.message_id
+    };
+    if (Number.isFinite(durSec) && durSec > 0) opts.duration = Math.floor(durSec);
+
+    try {
+      await ctx.replyWithAudio({ url: audioUrl }, opts);
+    } catch (e) {
+      // Telegram gagal mengambil URL -> unduh sendiri lalu upload
+      console.error('[spotify url gagal, coba upload manual]', e.message);
+      const dl = await axios.get(audioUrl, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
+      const filename = `${artist} - ${title}`.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'spotify';
+      await ctx.replyWithAudio({ source: Buffer.from(dl.data), filename: `${filename}.mp3` }, opts);
+    }
+  } catch (e) {
+    console.error('[spotify]', apiError(e));
+    await removeWait();
+    await ctx.reply('❌ Terjadi kesalahan!\n' + apiError(e).slice(0, 200), replyOpt).catch(() => {});
+  }
+});
+
+// ================= /imagine (text to image, live3d) =================
+let CryptoJS = null;
+try { CryptoJS = require('crypto-js'); } catch (_) { /* wajib: npm i crypto-js */ }
+
+const L3D = {
+  PUBLIC_KEY: `-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwlO+boC6cwRo3UfXVBadaYwcX
+0zKS2fuVNY2qZ0dgwb1NJ+/Q9FeAosL4ONiosD71on3PVYqRUlL5045mvH2K9i8b
+AFVMEip7E6RMK6tKAAif7xzZrXnP1GZ5Rijtqdgwh+YmzTo39cuBCsZqK9oEoeQ3
+r/myG9S+9cR5huTuFQIDAQAB
+-----END PUBLIC KEY-----`,
+  APP_ID: 'aifaceswap',
+  U_ID: '1H5tRtzsBkqXcaJ',
+  FN_NAME: 'demo-ai-body-v1',
+  BRAND_KEY: '8f3f0c7387123ae0',
+  BASE: 'https://app-v1.live3d.io',
+  IMG_BASE: 'https://temp.live3d.io/',
+  THEME: '83EmcUoQTUv50LhNx0VrdcK8rcGexcP35FcZDcpgWsAXEyO4xqL5shCY6sFIWB2Q',
+  MODEL: 'AbsoluteReality_v1.8.1.safetensors'
+};
+// bot ini hanya untuk gambar SFW: prompt eksplisit ditolak & negative prompt selalu menyertakan filter
+const IMAGINE_BLOCK_RE = /\b(nude|nudes|nudity|naked|nsfw|porn\w*|hentai|topless|bugil|telanjang|ngentot|sex\w*|explicit|erotic\w*|genital\w*|nipple\w*|undress\w*)\b/i;
+const IMAGINE_BASE_NEG = '(worst quality, low quality:1.4), deformed, ugly, bad anatomy, extra limbs, nsfw, nude, nudity';
+
+function l3dRandom(len) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  for (let i = 0; i < len; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
+  return out;
+}
+function l3dAes(data, key) {
+  const k = CryptoJS.enc.Utf8.parse(key);
+  return CryptoJS.AES.encrypt(data, k, { iv: k, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }).toString();
+}
+function l3dRsa(data) {
+  return crypto.publicEncrypt(
+    { key: L3D.PUBLIC_KEY, padding: crypto.constants.RSA_PKCS1_PADDING },
+    Buffer.from(data, 'utf8')
+  ).toString('base64');
+}
+function l3dHeaders(type, fp = null) {
+  const e = new Date();
+  const n = Math.floor(new Date(e.getUTCFullYear(), e.getUTCMonth(), e.getUTCDate(), e.getUTCHours(), e.getUTCMinutes(), e.getUTCSeconds()).getTime() / 1000);
+  const r = crypto.randomUUID();
+  const i = l3dRandom(16);
+  const fingerPrint = fp || crypto.randomBytes(16).toString('hex');
+  const s = l3dRsa(i);
+  const signStr = type === 'upload' ? `${L3D.APP_ID}:${r}:${s}` : `${L3D.APP_ID}:${L3D.U_ID}:${n}:${r}:${s}`;
+  return {
+    fp: fingerPrint,
+    fp1: l3dAes(`${L3D.APP_ID}:${fingerPrint}`, i),
+    'x-guide': s,
+    'x-sign': l3dAes(signStr, i),
+    'x-code': Date.now().toString()
+  };
+}
+
+async function l3dCreate(prompt, negative) {
+  const h = l3dHeaders('create');
+  const payload = {
+    fn_name: L3D.FN_NAME, call_type: 3, data: '',
+    input: { cfg: 7, lora: [], model: L3D.MODEL, negative_prompt: negative, prompt, request_from: 9 },
+    origin_from: L3D.BRAND_KEY, request_from: 9
+  };
+  const res = await axios.post(`${L3D.BASE}/aitools/of/create`, payload, {
+    headers: { 'User-Agent': UA, 'theme-version': L3D.THEME, ...h }, timeout: 30000
+  });
+  if (res.data.code !== 200) throw new Error(res.data.message || 'Gagal membuat job');
+  return { taskId: res.data.data.task_id, fp: h.fp };
+}
+
+async function l3dCheck(taskId, fp) {
+  const h = l3dHeaders('check', fp);
+  const res = await axios.post(`${L3D.BASE}/aitools/of/check-status`, {
+    task_id: taskId, fn_name: L3D.FN_NAME, call_type: 3, request_from: 9, origin_from: L3D.BRAND_KEY
+  }, { headers: { 'User-Agent': UA, 'theme-version': L3D.THEME, ...h }, timeout: 30000 });
+  return res.data.data;
+}
+
+async function generateImagine(prompt, userNegative) {
+  const negative = userNegative ? `${IMAGINE_BASE_NEG}, ${userNegative}` : IMAGINE_BASE_NEG;
+  const { taskId, fp } = await l3dCreate(prompt, negative);
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const r = await l3dCheck(taskId, fp);
+    if (r && r.status === 2 && r.result_image) return L3D.IMG_BASE + r.result_image;
+    if (r && r.status === 3) throw new Error('Task gagal / diblokir filter keamanan');
+  }
+  throw new Error('Timeout menunggu hasil gambar');
+}
+
+bot.command(['imagine', 'txt2img'], async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+  if (!raw) {
+    return ctx.reply('Masukkan deskripsi gambar setelah /imagine\nContoh: /imagine (masterpiece), 1girl, kimono, cherry blossom\n\nNegative prompt (opsional) pakai tanda |\n/imagine prompt | negative prompt');
+  }
+  if (!CryptoJS) return ctx.reply('❌ Modul crypto-js belum terpasang. Jalankan: npm i crypto-js');
+
+  const [prompt, ...negParts] = raw.split('|');
+  const userNeg = negParts.join('|').trim();
+  if (!prompt.trim()) return ctx.reply('❌ Prompt kosong.');
+  if (IMAGINE_BLOCK_RE.test(prompt)) {
+    return ctx.reply('❌ Prompt ditolak: fitur ini hanya untuk gambar non-eksplisit (SFW).');
+  }
+
+  const wait = await ctx.reply('🎨 Membuat gambar, tunggu sekitar 15-60 detik...');
+  // dijalankan terpisah supaya tidak kena handlerTimeout Telegraf (90 detik)
+  (async () => {
+    try {
+      const start = Date.now();
+      await ctx.sendChatAction('upload_photo').catch(() => {});
+      const url = await generateImagine(prompt.trim(), userNeg);
+      await ctx.replyWithPhoto(url, {
+        caption: `🎨 ${prompt.trim().slice(0, 900)}\n⏱️ ${((Date.now() - start) / 1000).toFixed(1)} detik`
+      }).catch(async (e) => {
+        console.error('[imagine url gagal, coba upload manual]', e.message);
+        const dl = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
+        await ctx.replyWithPhoto({ source: Buffer.from(dl.data) }, { caption: `🎨 ${prompt.trim().slice(0, 900)}` });
+      });
+      await ctx.deleteMessage(wait.message_id).catch(() => {});
+    } catch (e) {
+      console.error('[imagine]', apiError(e));
+      await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+        '❌ Gagal membuat gambar.\n' + apiError(e).slice(0, 200)).catch(() => {});
+    }
+  })();
+});
+
+// ================= /terabox (playterabox) =================
+const TERA_SALT = 'T9do@SM1?xGn5';
+const TERA_PATH = '/api/stream.php';
+const TERA_MAX_FILES = 5;          // maksimal file yang ditampilkan per link
+const TERA_TG_URL_LIMIT = 20 * 1024 * 1024; // Telegram hanya mau ambil video dari URL jika <= 20MB
+
+function teraToken(ts) {
+  return crypto.createHash('md5').update(TERA_SALT + ts + TERA_PATH).digest('hex');
+}
+
+async function fetchTerabox(teraUrl) {
+  const ts = Math.floor(Date.now() / 1000);
+  const endpoint = `https://playterabox.com/api/fetch-video?token=${teraToken(ts)}&t=${ts}`;
+  const { data } = await axios.post(endpoint, { url: teraUrl }, {
+    headers: {
+      'Accept': '*/*',
+      'Content-Type': 'application/json',
+      'Origin': 'https://playterabox.com',
+      'Referer': 'https://playterabox.com/',
+      'User-Agent': UA
+    },
+    timeout: 30000
+  });
+  if (!data || data.status !== 'success' || !Array.isArray(data.list)) {
+    const err = new Error((data && data.message) || 'Gagal mengekstrak file.');
+    err.noRetry = true;
+    throw err;
+  }
+  return {
+    totalFiles: data.total_files,
+    totalFolders: data.total_folders,
+    files: data.list.map((f) => ({
+      name: f.name,
+      size: f.size_formatted,
+      sizeBytes: Number(f.size) || 0,
+      duration: f.duration,
+      quality: f.quality,
+      thumbnail: f.thumbnail,
+      downloadLink: f.download_link,
+      normalDlink: f.normal_dlink,
+      fastStreamUrl: f.fast_stream_url,
+      subtitleUrl: f.subtitle_url
+    }))
+  };
+}
+
+const isHttp = (u) => typeof u === 'string' && /^https?:\/\//i.test(u) && u.length <= 2000;
+
+bot.command(['terabox', 'tera'], async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+  const m = raw.match(/https?:\/\/\S+/);
+  if (!m) {
+    return ctx.reply('Masukkan link Terabox setelah /terabox\nContoh: /terabox https://1024terabox.com/s/1xxxxxxxx');
+  }
+
+  const wait = await ctx.reply('⏳ Mengambil data Terabox...');
+  const removeWait = () => ctx.deleteMessage(wait.message_id).catch(() => {});
+  try {
+    const r = await fetchTerabox(m[0]);
+    if (!r.files.length) {
+      await removeWait();
+      return ctx.reply('❌ Tidak ada file di link ini' + (r.totalFolders ? ` (hanya ${r.totalFolders} folder)` : '') + '.');
+    }
+    await removeWait();
+
+    const shown = r.files.slice(0, TERA_MAX_FILES);
+    for (const f of shown) {
+      const lines = [
+        `📁 ${f.name || 'Tanpa nama'}`,
+        `📦 Ukuran: ${f.size || '-'}`,
+        f.duration ? `⏱️ Durasi: ${Number.isFinite(Number(f.duration)) ? fmtDuration(f.duration) : f.duration}` : null,
+        f.quality ? `🎞️ Kualitas: ${f.quality}` : null
+      ].filter(Boolean);
+      const caption = lines.join('\n').slice(0, 1000);
+
+      const buttons = [];
+      const dl = f.downloadLink || f.normalDlink;
+      if (isHttp(f.downloadLink)) buttons.push([Markup.button.url('⬇️ Download HD', f.downloadLink)]);
+      if (isHttp(f.normalDlink) && f.normalDlink !== f.downloadLink) buttons.push([Markup.button.url('⬇️ Download Normal', f.normalDlink)]);
+      if (isHttp(f.fastStreamUrl)) buttons.push([Markup.button.url('▶️ Stream', f.fastStreamUrl)]);
+      if (isHttp(f.subtitleUrl)) buttons.push([Markup.button.url('💬 Subtitle', f.subtitleUrl)]);
+      const kb = buttons.length ? Markup.inlineKeyboard(buttons) : {};
+
+      // file kecil: coba kirim langsung sebagai video; kalau gagal, jatuh ke kartu info + tombol link
+      if (isHttp(dl) && f.sizeBytes > 0 && f.sizeBytes <= TERA_TG_URL_LIMIT) {
+        try {
+          await ctx.sendChatAction('upload_video').catch(() => {});
+          await ctx.replyWithVideo(dl, { caption, supports_streaming: true, ...kb });
+          continue;
+        } catch (e) {
+          console.error('[terabox kirim langsung gagal]', e.message);
+        }
+      }
+
+      if (isHttp(f.thumbnail)) {
+        const ok = await ctx.replyWithPhoto(f.thumbnail, { caption, ...kb }).then(() => true).catch(() => false);
+        if (ok) continue;
+      }
+      await ctx.reply(caption, kb);
+    }
+
+    if (r.files.length > shown.length) {
+      await ctx.reply(`ℹ️ Menampilkan ${shown.length} dari ${r.files.length} file.`);
+    }
+  } catch (e) {
+    console.error('[terabox]', apiError(e));
+    await removeWait();
+    await ctx.reply('❌ Gagal mengambil data Terabox.\n' + apiError(e).slice(0, 200));
+  }
+});
+
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
 
@@ -780,12 +1391,10 @@ bot.on('text', async (ctx) => {
     await ctx.sendChatAction('typing').catch(() => {});
     const typing = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
     try {
-      const answer = await askAI(prompt);
+      const wantsCode = FILE_INTENT_RE.test(prompt);
+      const answer = await askAiSmart(ctx.session, wantsCode ? FILE_INSTRUCTION + prompt : prompt, prompt);
       clearInterval(typing);
-      const parts = chunkText(answer);
-      for (let i = 0; i < parts.length; i++) {
-        await ctx.reply(parts[i], i === parts.length - 1 ? aiKeyboard : undefined);
-      }
+      await sendAiAnswer(ctx, prompt, answer);
     } catch (e) {
       clearInterval(typing);
       console.error('[ai]', apiError(e));
