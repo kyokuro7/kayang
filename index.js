@@ -1108,51 +1108,180 @@ async function runHd(ctx, src) {
 }
 
 // ================= /play (YouTube audio) =================
-const PLAY_API = process.env.PLAY_API || 'https://api.ikyyxd.my.id/search/ytplayv2';
+// Fitur axcell
+// Fitur SC
+const FEATURE_CREDIT = 'Fitur axcell\nFitur SC';
+
+let yts = null;
+try { yts = require('yt-search'); } catch (_) { /* wajib: npm i yt-search */ }
+
+// Fallback opsional (ytdl.js milik bot WA). Isi PLAY_YTDL_PATH di .env jika ingin dipakai,
+// contoh: PLAY_YTDL_PATH=/root/bot/src/scraper/ytdl.js
+const PLAY_YTDL_PATH = clean(process.env.PLAY_YTDL_PATH);
+let ytdlMod = null;
+async function loadYtdl() {
+  if (ytdlMod || !PLAY_YTDL_PATH) return ytdlMod;
+  try {
+    ytdlMod = await import(require('url').pathToFileURL(PLAY_YTDL_PATH).href);
+  } catch (e) {
+    console.error('[play ytdl load]', e.message);
+  }
+  return ytdlMod;
+}
+
+const PLAY_API = process.env.PLAY_API || 'https://my.izuka-api.xyz/api/downloader/ytmp3';
 
 const fmtDuration = (sec) => {
   sec = Math.max(0, Math.floor(Number(sec) || 0));
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 };
 
+const formatNumber = (num = 0) => {
+  num = Number(num) || 0;
+  if (num >= 1e9) return (num / 1e9).toFixed(1) + 'B';
+  if (num >= 1e6) return (num / 1e6).toFixed(1) + 'M';
+  if (num >= 1e3) return (num / 1e3).toFixed(1) + 'K';
+  return String(num);
+};
+
+async function getAudio(url) {
+  try {
+    const { data } = await axios.get(PLAY_API, { params: { url }, timeout: 60000 });
+    const download = data && data.result && (data.result.download_url || data.result.download);
+    if (download) return { download, title: data.result.title };
+  } catch (e) {
+    console.error('[play api]', e.message);
+  }
+
+  const mod = await loadYtdl();
+  const ytdl = mod && mod.default;
+  if (typeof ytdl === 'function') {
+    const fb = await ytdl(url, 'mp3');
+    if (fb && fb.status && fb.dl) return { download: fb.dl, title: fb.title, fallback: true };
+    throw new Error((fb && fb.mess) || 'Gagal mendapatkan audio');
+  }
+  throw new Error('Gagal mendapatkan audio');
+}
+
+async function downloadAudio(url, fallback = false) {
+  const mod = fallback ? await loadYtdl() : null;
+  if (fallback && mod && typeof mod.fallbackToMp3Buffer === 'function') {
+    return Buffer.from(await mod.fallbackToMp3Buffer(url));
+  }
+
+  const res = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 120000,
+    maxContentLength: 50 * 1024 * 1024, // batas upload bot Telegram
+    maxBodyLength: 50 * 1024 * 1024,
+  });
+
+  const type = String(res.headers['content-type'] || '').toLowerCase();
+  if (type.includes('text/html') || type.includes('application/json')) {
+    throw new Error('URL download tidak mengembalikan audio');
+  }
+  return Buffer.from(res.data);
+}
+
+async function findVideo(query) {
+  if (!yts) throw new Error('Modul yt-search belum terpasang (npm i yt-search)');
+  const m = query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/i);
+  if (m) {
+    const v = await yts({ videoId: m[1] });
+    if (v) return v;
+  }
+  const search = await yts(query);
+  if (!search.videos || !search.videos.length) throw new Error('Lagu/video tidak ditemukan');
+  return search.videos[0];
+}
+
+// Fallback kedua (play2): dipakai otomatis jika jalur utama gagal.
+// Isi FAA_API di .env (base URL, tanpa slash di akhir), contoh: FAA_API=https://domain-api-kamu
+const FAA_API = clean(process.env.FAA_API).replace(/\/+$/, '');
+
+async function playFallback(ctx, query, skipThumb = false) {
+  if (!FAA_API) throw new Error('FAA_API belum diisi di .env');
+
+  const { data: json } = await axios.get(`${FAA_API}/faa/ytplay`, { params: { query }, timeout: 90000 });
+  if (!json || !json.status || !json.result || !json.result.mp3) throw new Error('API fallback error');
+  const d = json.result;
+
+  const caption =
+    `🎵 NOW PLAYING\n\n` +
+    `📌 Judul: ${d.title || query}\n` +
+    `👤 Channel: ${d.author || '-'}\n` +
+    `👀 Views: ${d.views != null ? formatNumber(d.views) : '-'}\n\n` +
+    `🔗 YouTube: ${d.url || '-'}`;
+
+  await ctx.sendChatAction('upload_voice').catch(() => {});
+  if (d.thumbnail && !skipThumb) {
+    await ctx.replyWithPhoto(d.thumbnail, { caption: caption.slice(0, 1000) })
+      .catch((e) => console.error('[play2 thumb]', e.message));
+  }
+
+  const title = String(d.title || query);
+  const opts = { title: title.slice(0, 100), performer: d.author ? String(d.author) : undefined };
+  try {
+    await ctx.replyWithAudio(d.mp3, opts);
+  } catch (e) {
+    console.error('[play2 url gagal, unduh manual]', e.message);
+    const dl = await axios.get(d.mp3, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
+    const filename = title.replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 80) || 'audio';
+    await ctx.replyWithAudio({ source: Buffer.from(dl.data), filename: `${filename}.mp3` }, opts);
+  }
+}
+
 async function runPlay(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const query = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
-  if (!query) return ctx.reply('Kirim judul lagu atau link YouTube.\nContoh: dewa 19 kangen');
+  if (!query) return ctx.reply('🎵 PLAY\n\nKirim judul lagu atau link YouTube.\nContoh: komang');
 
   const wait = await ctx.reply('🔎 Mencari lagu...');
+  let thumbSent = false;
   try {
-    const { data } = await axios.get(PLAY_API, { params: { q: query }, timeout: 90000 });
-    const res = data && data.result;
-    const audioUrl = res && res.audio && res.audio.url;
-    if (!data || !data.status || !audioUrl) {
-      console.log('[play raw]', JSON.stringify(data).slice(0, 500));
-      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Lagu tidak ditemukan').catch(() => {});
-    }
+    const video = await findVideo(query);
+    const result = await getAudio(video.url);
+    const audio = await downloadAudio(result.download, result.fallback);
 
-    const title = String(res.title || query);
-    const caption = `🎵 ${title}\n⏱️ ${fmtDuration(res.duration)}${res.source ? `\n🔗 ${res.source}` : ''}`.slice(0, 1000);
+    const caption =
+      `🎵 NOW PLAYING\n\n` +
+      `📌 Judul: ${video.title}\n` +
+      `👤 Channel: ${(video.author && video.author.name) || '-'}\n` +
+      `⏱️ Durasi: ${video.timestamp || '-'}\n` +
+      `👀 Views: ${formatNumber(video.views)}\n` +
+      `📅 Upload: ${video.ago || '-'}\n\n` +
+      `🔗 YouTube: ${video.url}`;
 
     await ctx.sendChatAction('upload_voice').catch(() => {});
-    if (res.thumbnail) {
-      await ctx.replyWithPhoto(res.thumbnail, { caption }).catch((e) => console.error('[play thumb]', e.message));
+    if (video.thumbnail) {
+      await ctx.replyWithPhoto(video.thumbnail, { caption: caption.slice(0, 1000) })
+        .then(() => { thumbSent = true; })
+        .catch((e) => console.error('[play thumb]', e.message));
     }
 
-    const opts = { title: title.slice(0, 100), duration: Math.floor(Number(res.duration) || 0) || undefined };
-    try {
-      await ctx.replyWithAudio(audioUrl, opts);
-    } catch (e) {
-      // Telegram gagal mengambil URL (file besar / server sumber menolak) -> unduh sendiri lalu upload
-      console.error('[play url gagal, coba upload manual]', e.message);
-      const dl = await axios.get(audioUrl, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
-      const filename = title.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'audio';
-      await ctx.replyWithAudio({ source: Buffer.from(dl.data), filename: `${filename}.mp3` }, opts);
-    }
+    const filename = String(video.title).replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 80) || 'audio';
+    await ctx.replyWithAudio(
+      { source: audio, filename: `${filename}.mp3` },
+      {
+        title: String(video.title).slice(0, 100),
+        performer: (video.author && video.author.name) || undefined,
+        duration: Math.floor(Number(video.seconds) || 0) || undefined,
+      }
+    );
     await ctx.deleteMessage(wait.message_id).catch(() => {});
   } catch (e) {
     console.error('[play]', apiError(e));
     await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
-      '❌ Gagal memproses, coba lagi nanti.\n' + apiError(e).slice(0, 200)).catch(() => {});
+      '⚠️ Jalur utama gagal, mencoba jalur cadangan...').catch(() => {});
+    try {
+      await playFallback(ctx, query, thumbSent);
+      await ctx.deleteMessage(wait.message_id).catch(() => {});
+    } catch (e2) {
+      console.error('[play2]', apiError(e2));
+      await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+        '❌ PLAY GAGAL\n\n' + String(apiError(e) || 'Gagal mengambil audio.').slice(0, 200) +
+        '\n\nCadangan: ' + String(apiError(e2)).slice(0, 150)).catch(() => {});
+    }
   }
 }
 
