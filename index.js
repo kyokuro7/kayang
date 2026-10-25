@@ -429,11 +429,6 @@ const LANG_EXT = {
   powershell: 'ps1', lua: 'lua', dart: 'dart', vue: 'vue', svelte: 'svelte', ini: 'ini', toml: 'toml',
   env: 'env', dockerfile: 'Dockerfile', txt: 'txt', text: 'txt', plaintext: 'txt'
 };
-const FILE_INTENT_RE = /\b(buat(?:kan|in)?|bikin(?:kan)?|create|generate|tulis(?:kan)?|write|coding|kode|code|script|file|html|css|javascript|python|php)\b/i;
-const FILE_INSTRUCTION =
-  'Jika kamu diminta membuat kode, tulis setiap file dalam blok kode terpisah dengan format ```bahasa:namafile.ext ' +
-  '(contoh: ```js:index.js atau ```css:style.css). Satu blok = satu file utuh. Jelaskan singkat di luar blok kode.\n\n';
-
 function safeFilename(name) {
   return String(name || '').replace(/\\/g, '/').split('/').pop().replace(/[^\w.\-]+/g, '_').replace(/^\.+/, '').slice(0, 80);
 }
@@ -485,32 +480,125 @@ function extractCodeFiles(answer) {
   return { files, text: text.trim() };
 }
 
-// kirim jawaban AI: teks biasa + file untuk blok kode
-async function sendAiAnswer(ctx, prompt, answer) {
-  const { files, text } = extractCodeFiles(answer);
-  const asFiles = files.length > 0 && (FILE_INTENT_RE.test(prompt) || files.some((f) => f.lines >= 15));
+// kirim jawaban AI Chat sebagai teks biasa (AI Chat hanya untuk ngobrol)
+async function sendChatReply(ctx, answer) {
+  const parts = chunkText(answer);
+  for (let i = 0; i < parts.length; i++) {
+    await ctx.reply(parts[i], i === parts.length - 1 ? aiKeyboard : undefined);
+  }
+}
 
-  if (!asFiles) {
-    const parts = chunkText(answer);
-    for (let i = 0; i < parts.length; i++) {
-      await ctx.reply(parts[i], i === parts.length - 1 ? aiKeyboard : undefined);
+// ---------- AI Coder (khusus bikin kode, hasil dikirim sebagai file) ----------
+const CODER_API = process.env.CODER_API || 'https://api.synoxcloud.xyz/ai-chat/ai-coder';
+const CODER_KEY = process.env.SYNOX_APIKEY || process.env.VN_APIKEY || 'FREE';
+const coderKeyboard = Markup.inlineKeyboard([[Markup.button.callback('🆕 Proyek Baru', 'coder_new'), Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+
+const newCoderId = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let id = '';
+  for (let i = 0; i < 7; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+};
+
+// cari objek file terstruktur {name, content} di mana pun dalam respons
+function findStructuredFiles(obj, out = [], depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 6) return out;
+  if (Array.isArray(obj)) {
+    for (const it of obj) {
+      if (it && typeof it === 'object' && !Array.isArray(it)) {
+        const name = it.filename || it.fileName || it.name || it.path;
+        const content = [it.content, it.code, it.text, it.source].find((v) => typeof v === 'string' && v.trim());
+        if (typeof name === 'string' && /\.\w{1,10}$/.test(name) && content) {
+          out.push({ name: safeFilename(name), code: content, lines: content.split('\n').length });
+          continue;
+        }
+      }
+      findStructuredFiles(it, out, depth + 1);
     }
+    return out;
+  }
+  for (const v of Object.values(obj)) findStructuredFiles(v, out, depth + 1);
+  return out;
+}
+
+function parseCoderResponse(data) {
+  let files = findStructuredFiles(data);
+  const text = extractAiText(data).trim();
+  let rest = text;
+  if (!files.length && text) {
+    const ex = extractCodeFiles(text);
+    files = ex.files;
+    rest = ex.text;
+    // jawaban berupa dokumen HTML mentah tanpa ```
+    if (!files.length && /^\s*(<!doctype html|<html[\s>])/i.test(text)) {
+      files = [{ name: 'index.html', code: text, lines: text.split('\n').length }];
+      rest = '';
+    }
+  }
+  // hindari nama file kembar
+  const used = new Set();
+  files = files.map((f, i) => {
+    let name = f.name || `kode-${i + 1}.txt`;
+    while (used.has(name.toLowerCase())) { const d = name.lastIndexOf('.'); name = d > 0 ? `${name.slice(0, d)}-${i + 1}${name.slice(d)}` : `${name}-${i + 1}`; }
+    used.add(name.toLowerCase());
+    return { ...f, name };
+  });
+  return { files, text: rest };
+}
+
+async function sendCoderResult(ctx, parsed) {
+  const { files, text } = parsed;
+  if (!files.length) {
+    const parts = chunkText(text || 'AI tidak mengembalikan kode.');
+    for (let i = 0; i < parts.length; i++) await ctx.reply(parts[i], i === parts.length - 1 ? coderKeyboard : undefined);
     return;
   }
-
-  if (text) {
-    for (const part of chunkText(text)) await ctx.reply(part);
-  }
+  if (text) for (const part of chunkText(text)) await ctx.reply(part);
   await ctx.sendChatAction('upload_document').catch(() => {});
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
-    const isLast = i === files.length - 1;
     await ctx.replyWithDocument(
       { source: Buffer.from(f.code, 'utf8'), filename: f.name },
-      { caption: `📄 ${f.name} (${f.lines} baris)`, ...(isLast ? aiKeyboard : {}) }
+      { caption: `📄 ${f.name} (${f.lines} baris)`, ...(i === files.length - 1 ? coderKeyboard : {}) }
     );
   }
 }
+
+async function runCoder(ctx) {
+  const prompt = ctx.message.text.trim();
+  if (!prompt) return;
+  if (!ctx.session.coderId) ctx.session.coderId = newCoderId();
+  const sessionId = ctx.session.coderId;
+  const wait = await ctx.reply('⌨️ AI Coder sedang menulis kode, bisa sampai 1-3 menit...');
+  // dijalankan terpisah supaya tidak kena handlerTimeout Telegraf (90 detik)
+  (async () => {
+    await ctx.sendChatAction('typing').catch(() => {});
+    const typing = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
+    try {
+      const { data } = await axios.get(CODER_API, {
+        params: { prompt, session: sessionId, apikey: CODER_KEY },
+        timeout: 240000
+      });
+      clearInterval(typing);
+      if (data && typeof data === 'object' && data.status === false) {
+        throw new Error(data.message || data.error || 'AI Coder menolak permintaan');
+      }
+      const parsed = parseCoderResponse(data);
+      if (!parsed.files.length && !parsed.text) {
+        console.log('[coder raw]', JSON.stringify(data).slice(0, 800));
+        throw new Error((data && (data.message || data.error)) || 'Respons kosong dari AI Coder');
+      }
+      await ctx.deleteMessage(wait.message_id).catch(() => {});
+      await sendCoderResult(ctx, parsed);
+    } catch (e) {
+      clearInterval(typing);
+      console.error('[coder]', apiError(e));
+      await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+        '❌ AI Coder error: ' + apiError(e).slice(0, 400), coderKeyboard).catch(() => {});
+    }
+  })();
+}
+
 
 
 // ================= FAKE ML (kyzznekoo canvas) =================
@@ -604,7 +692,11 @@ async function generateFakeMl({ avatar, username, rank, border }) {
 const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🔍 Find Preset AM', 'find_preset')],
   [Markup.button.callback('📧 Temp Mail', 'tempmail'), Markup.button.callback('⭐ AM Premium', 'am_premium')],
-  [Markup.button.callback('🤖 AI Chat', 'ai_chat'), Markup.button.callback('🎮 Fake ML', 'fake_ml')],
+  [Markup.button.callback('🤖 AI Chat', 'ai_chat'), Markup.button.callback('💻 AI Coder', 'ai_coder')],
+  [Markup.button.callback('🎮 Fake ML', 'fake_ml'), Markup.button.callback('🎵 Play Musik', 'flow_play')],
+  [Markup.button.callback('🖼 HD Foto', 'flow_hd'), Markup.button.callback('📸 Instagram', 'flow_ig')],
+  [Markup.button.callback('📘 Facebook', 'flow_fb'), Markup.button.callback('🎬 TikTok', 'flow_tiktok')],
+  [Markup.button.callback('📦 Terabox', 'flow_terabox'), Markup.button.callback('🎨 Buat Gambar', 'flow_imagine')],
   [Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
@@ -667,14 +759,17 @@ bot.action('help', async (ctx) => {
     `• TikTok: vt.tiktok.com, tiktok.com\n` +
     `• YouTube: youtu.be, youtube.com\n\n` +
     `<b>📧 Temp Mail</b>: buat email sementara & baca inbox-nya.\n` +
-    `<b>🎵 /play</b> &lt;judul/url&gt;: cari lagu YouTube dan kirim audionya.\n` +
-    `<b>📦 /terabox</b> &lt;link&gt;: ambil link download HD &amp; stream dari file Terabox.\n` +
-    `<b>📸 /ig</b> &lt;link&gt;: download foto/video/reel Instagram (otomatis deteksi, HD jika tersedia).\n` +
-    `<b>📱 /nomor</b> [negara]: daftar nomor virtual publik per negara (contoh: <code>/nomor indonesia</code>).\n` +
-    `<b>🎨 /imagine</b> &lt;prompt&gt; | &lt;negative&gt;: buat gambar dari teks (khusus SFW, butuh <code>npm i crypto-js</code>).\n` +
-    `<b>🖼 /hd</b>: reply sebuah foto dengan /hd untuk di-upscale jadi HD.\n` +
+    `<b>🎵 Play Musik</b>: kirim judul/link YouTube, bot kirim audionya.\n` +
+    `<b>🖼 HD Foto</b>: kirim foto, bot upscale jadi HD.\n` +
+    `<b>📸 Instagram</b>: download foto/video/reel (HD jika tersedia).\n` +
+    `<b>🎬 TikTok</b>: download video atau slideshow foto, plus link MP3-nya.\n` +
+    `<b>📘 Facebook</b>: download video lengkap dengan metadata (butuh <code>npm i cheerio</code>).\n` +
+    `<b>📦 Terabox</b>: ambil link download HD &amp; stream.\n` +
+    `<b>🎨 Buat Gambar</b>: gambar dari teks, khusus SFW (butuh <code>npm i crypto-js</code>).\n` +
+    `<b>📱 Nomor Virtual</b>: daftar nomor publik per negara, bisa ketik nama negara.\n` +
     `<b>🎮 Fake ML</b>: buat kartu profil Mobile Legends palsu (username, avatar, rank, border).\n` +
-    `<b>🤖 AI Chat</b>: ngobrol dengan AI, tiap pesan dijawab (tanpa memori percakapan).\n` +
+    `<b>🤖 AI Chat</b>: ngobrol biasa dengan AI, ingat obrolan sampai kamu tekan Chat Baru.\n` +
+    `<b>💻 AI Coder</b>: khusus bikin kode, hasilnya dikirim sebagai file (.html/.css/.js, dll) dan bisa direvisi.\n` +
     `<b>⭐ AM Premium</b>: login Satriam lewat magic link (kirim email → tempel link dari inbox).\n\n` +
     `Kalau error, coba lagi atau hubungi admin.`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'back_menu')]]) }
@@ -744,7 +839,7 @@ bot.action('tm_check', async (ctx) => {
 
 const aiIntro = () =>
   `<b>🤖 AI Chat</b> (${escapeHtml(AI_LABEL)})\n\nKirim pertanyaan/prompt apa saja, nanti dijawab AI.\n` +
-  `Minta dibuatkan kode (mis. "buatkan landing page html css js") dan hasilnya dikirim sebagai file.\n` +
+  `Menu ini khusus ngobrol. Untuk minta dibuatkan kode, pakai <b>💻 AI Coder</b>.\n` +
   `AI <b>ingat obrolan</b> selama sesi berjalan. Tekan <b>Chat Baru</b> untuk mulai dari nol, atau <b>Menu</b> untuk keluar.` +
   (AI_APIKEY ? '' : `\n\n⚠️ <b>AI_APIKEY</b> belum diisi di .env`);
 
@@ -763,6 +858,28 @@ bot.action('ai_new', async (ctx) => {
   ctx.session.aiHistory = [];
   await ctx.answerCbQuery('🆕 Obrolan baru dimulai');
   await ctx.reply('🆕 Obrolan baru dimulai. Silakan kirim pertanyaan.', aiKeyboard);
+});
+
+const coderIntro = () =>
+  `<b>💻 AI Coder</b>\n\nKhusus bikin kode. Jelaskan apa yang mau dibuat, hasilnya dikirim sebagai file (.html, .css, .js, dll).\n` +
+  `Contoh: <code>buat landing page portfolio modern</code>\n\n` +
+  `AI ingat konteks proyek yang sama, jadi kamu bisa minta revisi (mis. "ganti warna jadi biru"). Tekan <b>Proyek Baru</b> untuk mulai dari nol.`;
+
+bot.action('ai_coder', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  await ctx.answerCbQuery();
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'ai_coder';
+  ctx.session.coderId = newCoderId();
+  await safeEdit(ctx, coderIntro(), coderKeyboard);
+});
+
+bot.action('coder_new', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  ctx.session.step = 'ai_coder';
+  ctx.session.coderId = newCoderId();
+  await ctx.answerCbQuery('🆕 Proyek baru dimulai');
+  await ctx.reply('🆕 Proyek baru dimulai. Jelaskan kode yang mau dibuat.', coderKeyboard);
 });
 
 bot.action('fake_ml', async (ctx) => {
@@ -876,70 +993,97 @@ bot.action('am_premium', async (ctx) => {
     cancelKeyboard);
 });
 
-// ================= /hd (UPSCALE FOTO) =================
-const UPSCALE_API = process.env.UPSCALE_API || 'https://api.ikyyxd.my.id/tools/upscale';
+// ================= HD FOTO (upscaler 4x, imgupscaler.com) =================
+const UP_BASE = 'https://imgupscaler.com';
+const UP_SCALE = process.env.UPSCALE_SCALE || '4'; // 2 / 4 / 8 sesuai dukungan situs
+const UP_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36';
 
-// Link file Telegram berisi TOKEN BOT, jadi tidak boleh dikirim ke API pihak lain.
-// Foto diunduh di sini, lalu diunggah sementara (1 jam) ke litterbox untuk dapat URL publik.
+// Link file Telegram berisi TOKEN BOT, jadi tidak dikirim ke pihak lain: foto diunduh di sini lalu diunggah langsung.
 async function tgFileToBuffer(ctx, fileId) {
   const link = await ctx.telegram.getFileLink(fileId);
   const res = await axios.get(link.href, { responseType: 'arraybuffer', timeout: 60000 });
   return Buffer.from(res.data);
 }
 
-async function uploadTemp(buffer, filename = 'image.jpg') {
+const randomIPv4 = () => {
+  const r = () => Math.floor(Math.random() * 254) + 1;
+  return `${r()}.${r()}.${r()}.${r()}`;
+};
+
+async function upscaleBuffer(buffer, mime = 'image/jpeg', scale = UP_SCALE) {
+  const ip = randomIPv4();
+  const headers = {
+    'Origin': UP_BASE,
+    'Referer': `${UP_BASE}/`,
+    'User-Agent': UP_UA,
+    'X-Client-Ipv4': ip,
+    'X-Forwarded-For': ip
+  };
+
   const form = new FormData();
-  form.append('reqtype', 'fileupload');
-  form.append('time', '1h');
-  form.append('fileToUpload', new Blob([buffer]), filename);
-  const res = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
-    method: 'POST',
-    body: form,
-    signal: AbortSignal.timeout(60000)
+  form.append('tool', 'upscaler');
+  form.append('mode', 'batch');
+  form.append('scaleRadio', String(scale));
+  form.append('file', new Blob([buffer], { type: mime }), 'image.jpg');
+
+  const up = await fetch(`${UP_BASE}/api/legacy/upload`, {
+    method: 'POST', body: form, headers, signal: AbortSignal.timeout(90000)
   });
-  const url = (await res.text()).trim();
-  if (!/^https?:\/\//i.test(url)) throw new Error('Upload sementara gagal: ' + url.slice(0, 100));
-  return url;
+  const upText = await up.text();
+  let upData = null;
+  try { upData = JSON.parse(upText); } catch (_) { /* bukan JSON */ }
+  const taskId = upData && upData.taskId;
+  if (!taskId) {
+    console.log('[hd raw upload]', up.status, upText.slice(0, 400));
+    throw new Error('Gagal mendapatkan taskId dari server' + (up.ok ? '' : ` (HTTP ${up.status})`));
+  }
+
+  const start = Date.now();
+  for (let i = 0; i < 50; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const { data } = await axios.post(`${UP_BASE}/api/legacy/status`,
+      { tool: 'upscaler', taskId, scaleRadio: String(scale) },
+      { headers: { 'Content-Type': 'application/json', ...headers }, timeout: 30000 });
+    if (data && data.status === 'success' && Array.isArray(data.downloadUrls) && data.downloadUrls.length) {
+      return { url: data.downloadUrls[0], taskId, seconds: Math.round((Date.now() - start) / 1000) };
+    }
+    if (!data || data.status !== 'waiting') {
+      console.log('[hd raw status]', JSON.stringify(data).slice(0, 400));
+      throw new Error('Proses gagal di server');
+    }
+  }
+  throw new Error('Timeout: proses upscale terlalu lama');
 }
 
-bot.command('hd', async (ctx) => {
+async function runHd(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const q = ctx.message.reply_to_message;
-  const fileId = q && (
-    (q.photo && q.photo[q.photo.length - 1].file_id) ||
-    (q.document && /^image\//i.test(q.document.mime_type || '') && q.document.file_id)
-  );
-  if (!fileId) return ctx.reply('❌ Reply foto yang mau dibikin HD dengan perintah /hd');
+  const q = ctx.message;
+  const isImgDoc = q.document && /^image\//i.test(q.document.mime_type || '');
+  const fileId = (q.photo && q.photo[q.photo.length - 1].file_id) || (isImgDoc && q.document.file_id);
+  if (!fileId) return ctx.reply('❌ Kirim fotonya (sebagai foto atau file gambar) ya.');
+  const mime = isImgDoc ? q.document.mime_type : 'image/jpeg';
 
-  const wait = await ctx.reply('⏳ Tunggu sebentar...');
+  const wait = await ctx.reply(`⏳ Upscale ${UP_SCALE}x sedang diproses, tunggu sebentar...`);
   try {
+    await ctx.sendChatAction('upload_photo').catch(() => {});
     const buf = await tgFileToBuffer(ctx, fileId);
-    const publicUrl = await uploadTemp(buf);
-    const res = await axios.get(UPSCALE_API, { params: { url: publicUrl }, timeout: 120000 });
-    const r = (res.data && res.data.result) || {};
-    // format API pernah berubah: sekarang `downloadUrl` / `allDownloadUrls`, dulu `image`
-    const imageUrl = [r.image, r.downloadUrl, r.url, Array.isArray(r.allDownloadUrls) && r.allDownloadUrls[0]]
-      .find((u) => typeof u === 'string' && /^https?:\/\//i.test(u))
-      || (collectUrls(r).find((u) => /\.(jpe?g|png|webp)(\?|$)/i.test(u.url)) || {}).url;
-    if (!(res.data && res.data.status && imageUrl)) {
-      console.log('[hd raw]', JSON.stringify(res.data).slice(0, 500));
-      throw new Error((res.data && (res.data.error || res.data.message)) || 'API tidak mengembalikan gambar');
-    }
-    const info = [
-      r.scale ? `\n🔍 <b>Skala</b>: ${escapeHtml(r.scale)}` : '',
-      r.size ? `\n📦 <b>Size</b>: ${escapeHtml(r.size)}` : '',
-      res.data.runtime ? `\n⏱️ <b>Proses</b>: ${escapeHtml(res.data.runtime)}` : ''
-    ].join('');
+    const r = await upscaleBuffer(buf, mime);
     const extra = {
-      caption: `✅ <b>Berhasil di-upscale!</b>${info}`,
+      caption: `✅ <b>Berhasil di-upscale!</b>\n🔍 <b>Skala</b>: ${escapeHtml(UP_SCALE)}x\n⏱️ <b>Proses</b>: ${r.seconds} detik`,
       parse_mode: 'HTML',
       reply_to_message_id: ctx.message.message_id
     };
     try {
-      await ctx.replyWithPhoto(imageUrl, extra);
-    } catch (e) {
-      // foto terlalu besar untuk dikirim sebagai photo -> kirim sebagai file
-      await ctx.replyWithDocument(imageUrl, extra);
+      await ctx.replyWithPhoto(r.url, extra);
+    } catch (e1) {
+      try {
+        // hasil 4x sering melewati batas foto Telegram -> kirim sebagai file
+        await ctx.replyWithDocument(r.url, extra);
+      } catch (e2) {
+        console.error('[hd kirim via URL gagal, unduh manual]', e2.message);
+        const dl = await axios.get(r.url, { responseType: 'arraybuffer', timeout: 120000 });
+        await ctx.replyWithDocument({ source: Buffer.from(dl.data), filename: 'upscaled.jpg' }, extra);
+      }
     }
     await ctx.deleteMessage(wait.message_id).catch(() => {});
   } catch (e) {
@@ -947,7 +1091,7 @@ bot.command('hd', async (ctx) => {
     await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
       '❌ Terjadi kesalahan: ' + apiError(e).slice(0, 300)).catch(() => {});
   }
-});
+}
 
 // ================= /play (YouTube audio) =================
 const PLAY_API = process.env.PLAY_API || 'https://api.ikyyxd.my.id/search/ytplayv2';
@@ -957,10 +1101,10 @@ const fmtDuration = (sec) => {
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 };
 
-bot.command('play', async (ctx) => {
+async function runPlay(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const query = ctx.message.text.replace(/^\/play(@\w+)?\s*/i, '').trim();
-  if (!query) return ctx.reply('Masukkan judul/url setelah /play\nContoh: /play dewa 19 kangen');
+  if (!query) return ctx.reply('Kirim judul lagu atau link YouTube.\nContoh: dewa 19 kangen');
 
   const wait = await ctx.reply('🔎 Mencari lagu...');
   try {
@@ -996,7 +1140,7 @@ bot.command('play', async (ctx) => {
     await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
       '❌ Gagal memproses, coba lagi nanti.\n' + apiError(e).slice(0, 200)).catch(() => {});
   }
-});
+}
 
 // ================= /imagine (text to image, live3d) =================
 let CryptoJS = null;
@@ -1089,11 +1233,11 @@ async function generateImagine(prompt, userNegative) {
   throw new Error('Timeout menunggu hasil gambar');
 }
 
-bot.command(['imagine', 'txt2img'], async (ctx) => {
+async function runImagine(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
   if (!raw) {
-    return ctx.reply('Masukkan deskripsi gambar setelah /imagine\nContoh: /imagine (masterpiece), 1girl, kimono, cherry blossom\n\nNegative prompt (opsional) pakai tanda |\n/imagine prompt | negative prompt');
+    return ctx.reply('Kirim deskripsi gambar.\nContoh: (masterpiece), 1girl, kimono, cherry blossom\n\nNegative prompt (opsional) pakai tanda |\nprompt | negative prompt');
   }
   if (!CryptoJS) return ctx.reply('❌ Modul crypto-js belum terpasang. Jalankan: npm i crypto-js');
 
@@ -1125,7 +1269,7 @@ bot.command(['imagine', 'txt2img'], async (ctx) => {
         '❌ Gagal membuat gambar.\n' + apiError(e).slice(0, 200)).catch(() => {});
     }
   })();
-});
+}
 
 // ================= /terabox (playterabox) =================
 const TERA_SALT = 'T9do@SM1?xGn5';
@@ -1175,12 +1319,12 @@ async function fetchTerabox(teraUrl) {
 
 const isHttp = (u) => typeof u === 'string' && /^https?:\/\//i.test(u) && u.length <= 2000;
 
-bot.command(['terabox', 'tera'], async (ctx) => {
+async function runTerabox(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
   const m = raw.match(/https?:\/\/\S+/);
   if (!m) {
-    return ctx.reply('Masukkan link Terabox setelah /terabox\nContoh: /terabox https://1024terabox.com/s/1xxxxxxxx');
+    return ctx.reply('Kirim link Terabox.\nContoh: https://1024terabox.com/s/1xxxxxxxx');
   }
 
   const wait = await ctx.reply('⏳ Mengambil data Terabox...');
@@ -1237,7 +1381,7 @@ bot.command(['terabox', 'tera'], async (ctx) => {
     await removeWait();
     await ctx.reply('❌ Gagal mengambil data Terabox.\n' + apiError(e).slice(0, 200));
   }
-});
+}
 
 // ================= /ig (Instagram downloader, igexport) =================
 const IG_BASE = process.env.IG_BASE || 'https://igexport.com';
@@ -1325,13 +1469,13 @@ async function sendIgMedia(ctx, item, caption, replyOpt) {
   }
 }
 
-bot.command(['ig', 'instagram', 'igdl'], async (ctx) => {
+async function runInstagram(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
   const m = raw.match(/https?:\/\/(?:www\.)?instagram\.com\/\S+/i);
   const replyOpt = { reply_to_message_id: ctx.message.message_id };
   if (!m) {
-    return ctx.reply('Masukkan link Instagram setelah /ig\nContoh: /ig https://www.instagram.com/reel/xxxx/', replyOpt);
+    return ctx.reply('Kirim link Instagram (post/reel/story).\nContoh: https://www.instagram.com/reel/xxxx/', replyOpt);
   }
 
   const wait = await ctx.reply('⏳ Mengambil media Instagram...', replyOpt);
@@ -1359,7 +1503,7 @@ bot.command(['ig', 'instagram', 'igdl'], async (ctx) => {
     await removeWait();
     await ctx.reply('❌ Gagal mengambil media Instagram.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
   }
-});
+}
 
 // ================= /nomor (nomor virtual, synoxcloud) =================
 const VN_API = process.env.VN_API || 'https://api.synoxcloud.xyz/tools/virtual-numbers';
@@ -1405,7 +1549,7 @@ function vnMenuView(cache, page) {
   rows.push(nav);
   rows.push([Markup.button.callback('⬅️ Menu', 'back_menu')]);
   return {
-    text: `<b>📱 Nomor Virtual</b>\n${cache.total.toLocaleString('id-ID')} nomor dari ${cache.countries.length} negara.\nPilih negara:\n\n` +
+    text: `<b>📱 Nomor Virtual</b>\n${cache.total.toLocaleString('id-ID')} nomor dari ${cache.countries.length} negara.\nPilih negara, atau ketik nama negara (contoh: <code>indonesia</code>):\n\n` +
       `<i>Ini nomor publik: siapa pun bisa melihat SMS yang masuk, jadi jangan dipakai untuk akun penting.</i>`,
     kb: Markup.inlineKeyboard(rows)
   };
@@ -1427,7 +1571,7 @@ function vnCountryView(cache, idx) {
   };
 }
 
-bot.command(['nomor', 'vnum', 'virtualnumber'], async (ctx) => {
+async function runNomor(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
   const q = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim().toLowerCase();
   const wait = await ctx.reply('⏳ Mengambil daftar nomor...');
@@ -1446,7 +1590,7 @@ bot.command(['nomor', 'vnum', 'virtualnumber'], async (ctx) => {
     console.error('[vnum]', apiError(e));
     await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Gagal mengambil nomor.\n' + apiError(e).slice(0, 200)).catch(() => {});
   }
-});
+}
 
 async function vnAction(ctx, build) {
   if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
@@ -1460,12 +1604,242 @@ async function vnAction(ctx, build) {
     await ctx.answerCbQuery('❌ Gagal memuat').catch(() => {});
   }
 }
-bot.action('vn_menu', (ctx) => vnAction(ctx, (cache) => vnMenuView(cache, 0)));
+bot.action('vn_menu', (ctx) => {
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'in_nomor';
+  return vnAction(ctx, (cache) => vnMenuView(cache, 0));
+});
 bot.action(/^vn_p:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnMenuView(cache, Number(ctx.match[1]))));
 bot.action(/^vn_c:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnCountryView(cache, Number(ctx.match[1]))));
 
+// ================= /fb (Facebook downloader, fget + wayin metadata) =================
+const FB_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36';
+const FB_URL_RE = /https?:\/\/(?:[\w-]+\.)?(?:facebook\.com|fb\.watch|fb\.com)\/\S+/i;
+
+async function fetchFgetLinks(fbUrl) {
+  if (!cheerio) throw new Error('Modul cheerio belum terpasang. Jalankan: npm i cheerio');
+  const payload = new URLSearchParams({ id: fbUrl, locale: 'id' }).toString();
+  const { data: html } = await axios.post('https://fget.io/process', payload, {
+    headers: {
+      'User-Agent': FB_UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Hx-Current-Url': 'https://fget.io/id',
+      'Hx-Request': 'true',
+      'Hx-Target': 'target',
+      'Hx-Trigger': 'form',
+      'Origin': 'https://fget.io',
+      'Referer': 'https://fget.io/id'
+    },
+    timeout: 45000
+  });
+  const $ = cheerio.load(html);
+  const thumbnail = $('.result-thumbnail img').attr('src') || null;
+  const downloads = [];
+  $('.space-y-2 .flex').each((_, el) => {
+    const quality = $(el).find('.text-sm').text().trim();
+    const type = $(el).find('.text-xs').text().replace(/[()]/g, '').trim();
+    const url = $(el).find('a').attr('href');
+    if (quality && url) downloads.push({ quality, type, url });
+  });
+  return { thumbnail, downloads };
+}
+
+async function fetchWayinMeta(fbUrl) {
+  try {
+    const headers = {
+      'User-Agent': FB_UA, 'Content-Type': 'application/json',
+      'Origin': 'https://wayin.ai', 'Referer': 'https://wayin.ai/', 'X-Platform': 'web'
+    };
+    const parse = await axios.post(
+      `https://wayinvideo-api.wayin.ai/api/parse_url?url=${encodeURIComponent(fbUrl)}`, {}, { headers, timeout: 30000 });
+    const clean = (parse.data && parse.data.data) || fbUrl;
+    const metaRes = await axios.post('https://wayinvideo-api.wayin.ai/api/p/v2/get_video_meta',
+      { video_url: clean }, { headers, timeout: 30000 });
+    const m = (metaRes.data && metaRes.data.data) || {};
+    return {
+      title: m.title || null,
+      author: m.author || null,
+      abstract: m.abstract || null,
+      durationSec: m.duration ? Math.floor(m.duration / 1000) : null,
+      views: m.view_count || 0,
+      comments: m.comment_count || 0,
+      likes: m.like_count || 0,
+      published: m.published_at ? new Date(m.published_at * 1000) : null,
+      resolution: m.res || null
+    };
+  } catch (e) {
+    console.error('[fb meta]', e.message); // metadata hanya pelengkap, tidak fatal
+    return null;
+  }
+}
+
+const nfmt = (n) => Number(n || 0).toLocaleString('id-ID');
+
+async function runFacebook(ctx) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+  const m = raw.match(FB_URL_RE);
+  const replyOpt = { reply_to_message_id: ctx.message.message_id };
+  if (!m) return ctx.reply('Kirim link video Facebook.\nContoh: https://www.facebook.com/share/r/xxxx/', replyOpt);
+
+  const wait = await ctx.reply('⏳ Mengambil video Facebook...', replyOpt);
+  const removeWait = () => ctx.deleteMessage(wait.message_id).catch(() => {});
+  try {
+    const [links, meta] = await Promise.all([fetchFgetLinks(m[0]), fetchWayinMeta(m[0])]);
+    if (!links.downloads.length) throw new Error('Link download tidak ditemukan (pastikan video publik)');
+    await removeWait();
+
+    const lines = [`📘 ${meta && meta.title ? meta.title : 'Video Facebook'}`];
+    if (meta) {
+      if (meta.author) lines.push(`👤 ${meta.author}`);
+      if (meta.durationSec) lines.push(`⏱️ ${fmtDuration(meta.durationSec)}${meta.resolution ? ` • ${meta.resolution}` : ''}`);
+      lines.push(`👁 ${nfmt(meta.views)}  👍 ${nfmt(meta.likes)}  💬 ${nfmt(meta.comments)}`);
+      if (meta.published) lines.push(`📅 ${meta.published.toISOString().slice(0, 10)}`);
+    }
+    const caption = lines.join('\n').slice(0, 1000);
+
+    const dls = links.downloads.filter((d) => /^https?:\/\//i.test(d.url) && d.url.length <= 2000).slice(0, 8);
+    const kb = Markup.inlineKeyboard(dls.map((d) =>
+      [Markup.button.url(`⬇️ ${d.quality}${d.type ? ` (${d.type})` : ''}`.slice(0, 40), d.url)]));
+
+    // coba kirim langsung (butuh file <= 20MB); kalau gagal, kartu info + tombol download
+    const direct = dls.find((d) => !/mp3|audio/i.test(d.type + d.quality));
+    if (direct) {
+      try {
+        await ctx.sendChatAction('upload_video').catch(() => {});
+        await ctx.replyWithVideo(direct.url, { caption, supports_streaming: true, ...kb, ...replyOpt });
+        return;
+      } catch (e) {
+        console.error('[fb kirim langsung gagal]', e.message);
+      }
+    }
+    if (links.thumbnail && /^https?:\/\//i.test(links.thumbnail)) {
+      const ok = await ctx.replyWithPhoto(links.thumbnail, { caption, ...kb, ...replyOpt }).then(() => true).catch(() => false);
+      if (ok) return;
+    }
+    await ctx.reply(caption, { ...kb, ...replyOpt });
+  } catch (e) {
+    console.error('[fb]', apiError(e));
+    await removeWait();
+    await ctx.reply('❌ Gagal mengambil video Facebook.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
+  }
+}
+
+// ================= TikTok downloader (synoxcloud) =================
+const TT_API = process.env.TIKTOK_API || 'https://api.synoxcloud.xyz/download/tiktok';
+const TT_KEY = process.env.SYNOX_APIKEY || process.env.VN_APIKEY || 'FREE';
+const TT_URL_RE = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/i;
+const TT_MAX_BYTES = 50 * 1024 * 1024;
+
+async function runTikTok(ctx) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const raw = ctx.message.text.trim();
+  const m = raw.match(TT_URL_RE);
+  const replyOpt = { reply_to_message_id: ctx.message.message_id };
+  if (!m) return ctx.reply('Kirim link TikTok.\nContoh: https://vt.tiktok.com/ZSxxxxxx/', replyOpt);
+
+  const wait = await ctx.reply('⏳ Mengambil video TikTok...', replyOpt);
+  const removeWait = () => ctx.deleteMessage(wait.message_id).catch(() => {});
+  try {
+    const { data } = await axios.get(TT_API, { params: { url: m[0], apikey: TT_KEY }, timeout: 60000 });
+    const r = data && data.result;
+    const dls = (r && Array.isArray(r.downloads) ? r.downloads : []).filter((d) => d && /^https?:\/\//i.test(d.url || ''));
+    if (!data || !data.status || !r || !dls.length) {
+      console.log('[tiktok raw]', JSON.stringify(data).slice(0, 500));
+      throw new Error((data && (data.message || data.error)) || 'Video tidak ditemukan (pastikan link publik)');
+    }
+
+    const videos = dls.filter((d) => d.type === 'video');
+    const images = dls.filter((d) => /^(image|photo)$/i.test(d.type));
+    const music = dls.find((d) => /^(music|audio)$/i.test(d.type));
+    const author = r.author && r.author !== 'Unknown' ? `\n👤 ${r.author}` : '';
+    const caption = `🎬 ${r.title || 'TikTok'}${author}`.slice(0, 1000);
+    await removeWait();
+
+    // slideshow foto: kirim sebagai album (maks 10)
+    if (!videos.length && images.length) {
+      await ctx.sendChatAction('upload_photo').catch(() => {});
+      const group = images.slice(0, 10).map((d, i) => ({ type: 'photo', media: d.url, ...(i === 0 ? { caption } : {}) }));
+      await ctx.replyWithMediaGroup(group, replyOpt).catch(async (e) => {
+        console.error('[tiktok album gagal]', e.message);
+        const kb = Markup.inlineKeyboard(images.slice(0, 8).map((d, i) => [Markup.button.url(`🖼 Foto ${i + 1}`, d.url)]));
+        await ctx.reply(caption, { ...kb, ...replyOpt });
+      });
+      if (music) await ctx.reply('🎵 Musiknya:', { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download MP3', music.url)]]), ...replyOpt });
+      return;
+    }
+
+    if (!videos.length) throw new Error('Tidak ada video di hasil');
+    const buttons = [];
+    if (videos[1]) buttons.push([Markup.button.url('⬇️ Video (alternatif)', videos[1].url)]);
+    if (music) buttons.push([Markup.button.url('🎵 Download MP3', music.url)]);
+    const kb = buttons.length ? Markup.inlineKeyboard(buttons) : {};
+
+    await ctx.sendChatAction('upload_video').catch(() => {});
+    try {
+      await ctx.replyWithVideo(videos[0].url, { caption, supports_streaming: true, ...kb, ...replyOpt });
+    } catch (e) {
+      console.error('[tiktok kirim via URL gagal, unduh manual]', e.message);
+      const dl = await axios.get(videos[0].url, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: TT_MAX_BYTES });
+      const buf = Buffer.from(dl.data);
+      try {
+        await ctx.replyWithVideo({ source: buf, filename: 'tiktok.mp4' }, { caption, supports_streaming: true, ...kb, ...replyOpt });
+      } catch (e2) {
+        await ctx.replyWithDocument({ source: buf, filename: 'tiktok.mp4' }, { caption, ...kb, ...replyOpt });
+      }
+    }
+  } catch (e) {
+    console.error('[tiktok]', apiError(e));
+    await removeWait();
+    await ctx.reply('❌ Gagal mengambil video TikTok.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
+  }
+}
+
+// ================= MENU TOMBOL: input untuk fitur (menggantikan command) =================
+const INPUT_FLOWS = {
+  play: { icon: '🎵', title: 'Play Musik', run: runPlay,
+    hint: 'Kirim judul lagu atau link YouTube.\nContoh: <code>dewa 19 kangen</code>' },
+  hd: { icon: '🖼', title: 'HD Foto (Upscale)', run: runHd,
+    hint: 'Kirim foto yang mau di-upscale jadi HD (sebagai foto atau file gambar).' },
+  ig: { icon: '📸', title: 'Instagram Downloader', run: runInstagram,
+    hint: 'Kirim link Instagram (post, reel, atau story).\nContoh: <code>https://www.instagram.com/reel/xxxx/</code>' },
+  tiktok: { icon: '🎬', title: 'TikTok Downloader', run: runTikTok,
+    hint: 'Kirim link TikTok (video atau slideshow foto).\nContoh: <code>https://vt.tiktok.com/ZSxxxxxx/</code>' },
+  fb: { icon: '📘', title: 'Facebook Downloader', run: runFacebook,
+    hint: 'Kirim link video Facebook.\nContoh: <code>https://www.facebook.com/share/r/xxxx/</code>' },
+  terabox: { icon: '📦', title: 'Terabox Downloader', run: runTerabox,
+    hint: 'Kirim link Terabox.\nContoh: <code>https://1024terabox.com/s/1xxxxxxxx</code>' },
+  imagine: { icon: '🎨', title: 'Buat Gambar (SFW)', run: runImagine,
+    hint: 'Kirim deskripsi gambar (bahasa Inggris biasanya lebih bagus).\nContoh: <code>(masterpiece), 1girl, kimono, cherry blossom</code>\n\nNegative prompt opsional, pisahkan dengan <code>|</code>:\n<code>prompt | negative prompt</code>' }
+};
+
+bot.action(/^flow_(\w+)$/, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  const flow = INPUT_FLOWS[ctx.match[1]];
+  if (!flow) return ctx.answerCbQuery('Menu tidak dikenal');
+  await ctx.answerCbQuery();
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = `in_${ctx.match[1]}`;
+  await safeEdit(ctx,
+    `<b>${flow.icon} ${flow.title}</b>\n\n${flow.hint}\n\n<i>Setelah selesai kamu bisa langsung kirim lagi. Tekan Menu untuk keluar.</i>`,
+    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu', 'back_menu')]]));
+});
+
+// foto/file gambar -> hanya diproses saat mode HD Foto aktif
+bot.on(['photo', 'document'], async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  if (ctx.session.step !== 'in_hd') return;
+  return runHd(ctx);
+});
+
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
+
+  // ---- fitur dari tombol menu (play, ig, fb, terabox, imagine, nomor, hd) ----
+  const stepName = typeof ctx.session.step === 'string' && ctx.session.step.startsWith('in_') ? ctx.session.step.slice(3) : null;
+  if (stepName === 'nomor') return runNomor(ctx);
+  if (stepName === 'hd') return ctx.reply('🖼 Kirim fotonya (bukan teks) ya.');
+  if (stepName && INPUT_FLOWS[stepName]) return INPUT_FLOWS[stepName].run(ctx);
 
   // ---- alur Fake ML: username & avatar ----
   if (ctx.session.step === 'fml_username') {
@@ -1494,16 +1868,17 @@ bot.on('text', async (ctx) => {
   }
 
   // ---- mode AI Chat ----
+  if (ctx.session.step === 'ai_coder') return runCoder(ctx);
+
   if (ctx.session.step === 'ai_chat') {
     const prompt = ctx.message.text.trim();
     if (!prompt) return;
     await ctx.sendChatAction('typing').catch(() => {});
     const typing = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
     try {
-      const wantsCode = FILE_INTENT_RE.test(prompt);
-      const answer = await askAiChat(ctx.session, wantsCode ? FILE_INSTRUCTION + prompt : prompt, prompt);
+      const answer = await askAiChat(ctx.session, prompt, prompt);
       clearInterval(typing);
-      await sendAiAnswer(ctx, prompt, answer);
+      await sendChatReply(ctx, answer);
     } catch (e) {
       clearInterval(typing);
       console.error('[ai]', apiError(e));
