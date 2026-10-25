@@ -565,7 +565,7 @@ async function sendCoderResult(ctx, parsed) {
 }
 
 async function runCoder(ctx) {
-  const prompt = ctx.message.text.trim();
+  const prompt = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
   if (!prompt) return;
   if (!ctx.session.coderId) ctx.session.coderId = newCoderId();
   const sessionId = ctx.session.coderId;
@@ -747,10 +747,8 @@ bot.action('back_menu', async (ctx) => {
   );
 });
 
-bot.action('help', async (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
-  await ctx.answerCbQuery();
-  await ctx.editMessageText(
+function helpText() {
+  return (
     `<b>📖 Bantuan</b>\n\n` +
     `1. Tekan <b>Find Preset AM</b>\n` +
     `2. Kirim link TikTok/YouTube\n` +
@@ -774,7 +772,20 @@ bot.action('help', async (ctx) => {
     `<b>🤖 AI Chat</b>: ngobrol biasa dengan AI, ingat obrolan sampai kamu tekan Chat Baru.\n` +
     `<b>💻 AI Coder</b>: khusus bikin kode, hasilnya dikirim sebagai file (.html/.css/.js, dll) dan bisa direvisi.\n` +
     `<b>⭐ AM Premium</b>: login Satriam lewat magic link (kirim email → tempel link dari inbox).\n\n` +
-    `Kalau error, coba lagi atau hubungi admin.`,
+    `<b>⚡ Command cepat</b> (tanpa isi = buka mode input)\n` +
+    `/play judul • /ig /fb /tiktok /spotify /terabox link • /hd (reply foto)\n` +
+    `/imagine prompt • /nomor negara • /ai pesan • /coder perintah\n` +
+    `/idcard nama | jabatan | teks | kontak\n` +
+    `/spcard judul | artis | cover • /menu • /help\n\n` +
+    `Kalau error, coba lagi atau hubungi admin.`
+  );
+}
+
+bot.action('help', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    helpText(),
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'back_menu')]]) }
   );
 });
@@ -1058,9 +1069,9 @@ async function upscaleBuffer(buffer, mime = 'image/jpeg', scale = UP_SCALE) {
   throw new Error('Timeout: proses upscale terlalu lama');
 }
 
-async function runHd(ctx) {
+async function runHd(ctx, src) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const q = ctx.message;
+  const q = src || ctx.message;
   const isImgDoc = q.document && /^image\//i.test(q.document.mime_type || '');
   const fileId = (q.photo && q.photo[q.photo.length - 1].file_id) || (isImgDoc && q.document.file_id);
   if (!fileId) return ctx.reply('❌ Kirim fotonya (sebagai foto atau file gambar) ya.');
@@ -1106,7 +1117,7 @@ const fmtDuration = (sec) => {
 
 async function runPlay(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const query = ctx.message.text.replace(/^\/play(@\w+)?\s*/i, '').trim();
+  const query = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
   if (!query) return ctx.reply('Kirim judul lagu atau link YouTube.\nContoh: dewa 19 kangen');
 
   const wait = await ctx.reply('🔎 Mencari lagu...');
@@ -1953,6 +1964,26 @@ async function canvasImage(endpoint, params) {
   throw new Error(msg);
 }
 
+async function generateCard(ctx, key, data) {
+  const w = WIZARDS[key];
+  const wait = await ctx.reply('⏳ Membuat kartu...');
+  const again = Markup.inlineKeyboard([[Markup.button.callback('🔁 Buat lagi', `wiz_${key}`), Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+  try {
+    await ctx.sendChatAction('upload_photo').catch(() => {});
+    const buf = await canvasImage(w.endpoint, data);
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+    try {
+      await ctx.replyWithPhoto({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
+    } catch (e) {
+      await ctx.replyWithDocument({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
+    }
+  } catch (e) {
+    console.error('[canvas]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Gagal membuat kartu: ' + apiError(e).slice(0, 250), again).catch(() => {});
+  }
+}
+
 async function runWizardStep(ctx) {
   const wiz = ctx.session.wiz;
   const w = wiz && WIZARDS[wiz.key];
@@ -1972,22 +2003,7 @@ async function runWizardStep(ctx) {
   const data = wiz.data;
   ctx.session.step = null;
   ctx.session.wiz = null;
-  const wait = await ctx.reply('⏳ Membuat kartu...');
-  const again = Markup.inlineKeyboard([[Markup.button.callback('🔁 Buat lagi', `wiz_${wiz.key}`), Markup.button.callback('⬅️ Menu', 'back_menu')]]);
-  try {
-    await ctx.sendChatAction('upload_photo').catch(() => {});
-    const buf = await canvasImage(w.endpoint, data);
-    await ctx.deleteMessage(wait.message_id).catch(() => {});
-    try {
-      await ctx.replyWithPhoto({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
-    } catch (e) {
-      await ctx.replyWithDocument({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
-    }
-  } catch (e) {
-    console.error('[canvas]', apiError(e));
-    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
-      '❌ Gagal membuat kartu: ' + apiError(e).slice(0, 250), again).catch(() => {});
-  }
+  await generateCard(ctx, wiz.key, data);
 }
 
 // ================= MENU TOMBOL: input untuk fitur (menggantikan command) =================
@@ -2025,9 +2041,130 @@ bot.action(/^flow_(\w+)$/, async (ctx) => {
 // foto/file gambar -> hanya diproses saat mode HD Foto aktif
 bot.on(['photo', 'document'], async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
+  // foto dengan caption /hd langsung diproses
+  if (/^\/hd(@\w+)?(\s|$)/i.test(ctx.message.caption || '')) {
+    ctx.session.step = 'in_hd';
+    return runHd(ctx);
+  }
   if (ctx.session.step !== 'in_hd') return;
   return runHd(ctx);
 });
+
+// ================= COMMAND SLASH (jalan pintas, selain tombol menu) =================
+// Pakai langsung: /ig <link>. Tanpa isi (/ig saja) = masuk mode input seperti menekan tombol.
+const argOf = (ctx) => ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+const adminOnly = (ctx) => ctx.from.id.toString() === ADMIN_ID;
+
+async function runAiChat(ctx, prompt) {
+  if (!prompt) return;
+  await ctx.sendChatAction('typing').catch(() => {});
+  const typing = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
+  try {
+    const answer = await askAiChat(ctx.session, prompt, prompt);
+    clearInterval(typing);
+    await sendChatReply(ctx, answer);
+  } catch (e) {
+    clearInterval(typing);
+    console.error('[ai]', apiError(e));
+    await ctx.reply('❌ AI error: ' + apiError(e).slice(0, 500), aiKeyboard);
+  }
+}
+
+const CMD_FLOWS = [
+  [['play'], 'play'], [['hd'], 'hd'], [['ig', 'instagram', 'igdl'], 'ig'], [['fb', 'facebook', 'fbdl'], 'fb'],
+  [['tiktok', 'tt'], 'tiktok'], [['spotify', 'spotifydl'], 'spotify'], [['terabox', 'tera'], 'terabox'],
+  [['imagine', 'txt2img'], 'imagine']
+];
+for (const [names, key] of CMD_FLOWS) {
+  bot.command(names, async (ctx) => {
+    if (!adminOnly(ctx)) return;
+    const flow = INPUT_FLOWS[key];
+    ctx.session.waitingForUrl = false;
+    ctx.session.step = `in_${key}`; // setelah ini pesan berikutnya juga langsung diproses
+    if (key === 'hd') {
+      const rp = ctx.message.reply_to_message;
+      if (rp && (rp.photo || (rp.document && /^image\//i.test(rp.document.mime_type || '')))) return runHd(ctx, rp);
+    } else if (argOf(ctx)) {
+      return flow.run(ctx);
+    }
+    return ctx.reply(`<b>${flow.icon} ${flow.title}</b>\n\n${flow.hint}\n\n<i>Setelah selesai kamu bisa langsung kirim lagi. Tekan Menu untuk keluar.</i>`,
+      { parse_mode: 'HTML', ...wizKb });
+  });
+}
+
+bot.command(['nomor', 'vnum', 'virtualnumber'], async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'in_nomor';
+  return runNomor(ctx);
+});
+
+bot.command('ai', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'ai_chat';
+  const arg = argOf(ctx);
+  if (arg) return runAiChat(ctx, arg);
+  return ctx.reply(aiIntro(), { parse_mode: 'HTML', ...aiKeyboard });
+});
+
+bot.command('coder', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'ai_coder';
+  if (!ctx.session.coderId) ctx.session.coderId = newCoderId();
+  if (argOf(ctx)) return runCoder(ctx);
+  return ctx.reply(coderIntro(), { parse_mode: 'HTML', ...coderKeyboard });
+});
+
+// /idcard nama | jabatan | teks | kontak   dan   /spcard judul | artis | cover
+for (const [names, key] of [[['idcard'], 'idcard'], [['spcard', 'spotifycard'], 'spcard']]) {
+  bot.command(names, async (ctx) => {
+    if (!adminOnly(ctx)) return;
+    const w = WIZARDS[key];
+    ctx.session.waitingForUrl = false;
+    const parts = argOf(ctx).split('|').map((x) => x.trim());
+    const required = w.fields.filter((f) => !f.optional).length;
+    if (parts.length >= required && parts.slice(0, required).every(Boolean)) {
+      const data = {};
+      for (let i = 0; i < w.fields.length; i++) {
+        const f = w.fields[i];
+        const v = parts[i];
+        if (!v || v === '-') continue;
+        if (f.url && !/^https?:\/\/\S+$/i.test(v)) return ctx.reply('❌ Cover harus berupa link gambar yang diawali https://');
+        data[f.key] = v.slice(0, f.max);
+      }
+      ctx.session.step = null;
+      return generateCard(ctx, key, data);
+    }
+    ctx.session.step = 'wiz';
+    ctx.session.wiz = { key, i: 0, data: {} };
+    return ctx.reply(`<b>${w.icon} ${w.title}</b>\n\n${w.fields[0].ask}`, { parse_mode: 'HTML', ...wizKb });
+  });
+}
+
+bot.command('menu', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = null;
+  return ctx.reply(
+    `<b>👋 Hai bosq! Selamat datang di AM Preset Bot</b>\n\nPilih menu di bawah ya:`,
+    { parse_mode: 'HTML', ...mainMenu });
+});
+
+bot.command('help', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  return ctx.reply(helpText(), { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu', 'back_menu')]]) });
+});
+
+// daftar yang muncul saat mengetik "/" di Telegram
+const CMD_MENU = [
+  ['play', 'Cari & kirim lagu YouTube'], ['hd', 'Upscale foto jadi HD (reply foto)'],
+  ['ig', 'Download Instagram'], ['fb', 'Download Facebook'], ['tiktok', 'Download TikTok'],
+  ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['imagine', 'Buat gambar dari teks (SFW)'],
+  ['nomor', 'Nomor virtual publik'], ['ai', 'Ngobrol dengan AI'], ['coder', 'AI Coder (bikin kode)'],
+  ['idcard', 'Buat ID Card'], ['spcard', 'Buat Spotify Card'], ['menu', 'Buka menu utama'], ['help', 'Bantuan']
+].map(([command, description]) => ({ command, description }));
 
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
@@ -2068,22 +2205,7 @@ bot.on('text', async (ctx) => {
   // ---- mode AI Chat ----
   if (ctx.session.step === 'ai_coder') return runCoder(ctx);
 
-  if (ctx.session.step === 'ai_chat') {
-    const prompt = ctx.message.text.trim();
-    if (!prompt) return;
-    await ctx.sendChatAction('typing').catch(() => {});
-    const typing = setInterval(() => ctx.sendChatAction('typing').catch(() => {}), 4000);
-    try {
-      const answer = await askAiChat(ctx.session, prompt, prompt);
-      clearInterval(typing);
-      await sendChatReply(ctx, answer);
-    } catch (e) {
-      clearInterval(typing);
-      console.error('[ai]', apiError(e));
-      await ctx.reply('❌ AI error: ' + apiError(e).slice(0, 500), aiKeyboard);
-    }
-    return;
-  }
+  if (ctx.session.step === 'ai_chat') return runAiChat(ctx, ctx.message.text.trim());
 
   // ---- alur AM Premium: step email ----
   if (ctx.session.step === 'am_email') {
@@ -2198,8 +2320,9 @@ bot.on('text', async (ctx) => {
 bot.catch((err, ctx) => console.error('Bot error:', err));
 
 bot.telegram.getMe()
-  .then((me) => {
+  .then(async (me) => {
     console.log(`✅ Token valid: @${me.username}`);
+    await bot.telegram.setMyCommands(CMD_MENU).catch((e) => console.error('[setMyCommands]', e.message));
     return bot.launch();
   })
   .catch((err) => {
