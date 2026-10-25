@@ -3,6 +3,8 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { Telegraf, Markup, session } = require('telegraf');
 const axios = require('axios');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 
 const clean = (v) => (v || '').trim().replace(/^["']|["']$/g, '');
 const BOT_TOKEN = clean(process.env.BOT_TOKEN);
@@ -697,8 +699,7 @@ const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🖼 HD Foto', 'flow_hd'), Markup.button.callback('📸 Instagram', 'flow_ig')],
   [Markup.button.callback('📘 Facebook', 'flow_fb'), Markup.button.callback('🎬 TikTok', 'flow_tiktok')],
   [Markup.button.callback('🎧 Spotify', 'flow_spotify'), Markup.button.callback('📦 Terabox', 'flow_terabox')],
-  [Markup.button.callback('🎨 Buat Gambar', 'flow_imagine'), Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
-  [Markup.button.callback('⭐ AM Bulk', 'flow_ambulk')],
+  [Markup.button.callback('📹 HD Video', 'flow_hdvid')],
   [Markup.button.callback('🪪 ID Card', 'wiz_idcard'), Markup.button.callback('🎵 Spotify Card', 'wiz_spcard')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
@@ -767,16 +768,13 @@ function helpText() {
     `<b>🪪 ID Card</b> &amp; <b>🎵 Spotify Card</b>: buat kartu gambar, bot menanyakan datanya satu per satu.\n` +
     `<b>📘 Facebook</b>: download video lengkap dengan metadata (butuh <code>npm i cheerio</code>).\n` +
     `<b>📦 Terabox</b>: ambil link download HD &amp; stream.\n` +
-    `<b>🎨 Buat Gambar</b>: gambar dari teks, khusus SFW (butuh <code>npm i crypto-js</code>).\n` +
-    `<b>📱 Nomor Virtual</b>: daftar nomor publik per negara, bisa ketik nama negara.\n` +
     `<b>🎮 Fake ML</b>: buat kartu profil Mobile Legends palsu (username, avatar, rank, border).\n` +
     `<b>🤖 AI Chat</b>: ngobrol biasa dengan AI, ingat obrolan sampai kamu tekan Chat Baru.\n` +
     `<b>💻 AI Coder</b>: khusus bikin kode, hasilnya dikirim sebagai file (.html/.css/.js, dll) dan bisa direvisi.\n` +
     `<b>⭐ AM Premium</b>: login Satriam lewat magic link (kirim email → tempel link dari inbox).\n\n` +
     `<b>⚡ Command cepat</b> (tanpa isi = buka mode input)\n` +
     `/play judul • /ig /fb /tiktok /spotify /terabox link • /hd (reply foto)\n` +
-    `/imagine prompt • /nomor negara • /ai pesan • /coder perintah\n` +
-    `/ambulk jumlah (1-10)\n` +
+    `/ai pesan • /coder perintah • /hdvid (reply video)\n` +
     `/idcard nama | jabatan | teks | kontak\n` +
     `/spcard judul | artis | cover • /menu • /help\n\n` +
     `Kalau error, coba lagi atau hubungi admin.`
@@ -1109,6 +1107,73 @@ async function runHd(ctx, src) {
   }
 }
 
+// ================= /hdvid (enhance video pakai FFmpeg) =================
+let ffmpeg = null;
+try {
+  ffmpeg = require('fluent-ffmpeg');
+  ffmpeg.setFfmpegPath(require('@ffmpeg-installer/ffmpeg').path);
+} catch (_) { /* wajib: npm i fluent-ffmpeg @ffmpeg-installer/ffmpeg */ }
+
+const HDVID_MAX_BYTES = 20 * 1024 * 1024; // batas download file via Bot API Telegram
+let hdvidBusy = false;
+
+function hdvidFileOf(q) {
+  if (!q) return null;
+  if (q.video) return q.video;
+  if (q.animation) return q.animation;
+  if (q.document && /^video\//i.test(q.document.mime_type || '')) return q.document;
+  return null;
+}
+
+async function runHdVid(ctx, src) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  if (!ffmpeg) return ctx.reply('❌ Modul FFmpeg belum terpasang.\nJalankan: npm i fluent-ffmpeg @ffmpeg-installer/ffmpeg');
+
+  const file = hdvidFileOf(src || ctx.message);
+  if (!file) return ctx.reply('❌ Kirim videonya (sebagai video atau file video) ya.');
+  if (file.file_size && file.file_size > HDVID_MAX_BYTES) {
+    return ctx.reply(`❌ File terlalu besar (${(file.file_size / 1048576).toFixed(1)} MB). Maksimal 20 MB karena batas download bot Telegram.`);
+  }
+  if (hdvidBusy) return ctx.reply('⏳ Masih ada video yang sedang diproses, tunggu selesai dulu ya.');
+
+  hdvidBusy = true;
+  const stamp = Date.now();
+  const inputPath = path.join(os.tmpdir(), `input-hd-${stamp}.mp4`);
+  const outputPath = path.join(os.tmpdir(), `output-hd-${stamp}.mp4`);
+  const wait = await ctx.reply('🎞️ PROSES ENHANCE DIMULAI\n\nVideo sedang diproses agar jadi HD ✨\nWaktu tergantung ukuran video, mohon bersabar ya.');
+  try {
+    const buf = await tgFileToBuffer(ctx, file.file_id);
+    if (!buf || !buf.length) throw new Error('Video gagal diunduh');
+    fs.writeFileSync(inputPath, buf);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .videoFilters(['scale=iw*2:ih*2:flags=lanczos', 'unsharp=5:5:1.0:5:5:0.0'])
+        .outputOptions(['-c:v libx264', '-preset fast', '-crf 23', '-pix_fmt yuv420p', '-movflags +faststart', '-c:a copy'])
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    const size = fs.statSync(outputPath).size;
+    if (size > 50 * 1024 * 1024) throw new Error(`Hasil ${(size / 1048576).toFixed(1)} MB, melebihi batas upload bot 50 MB`);
+
+    await ctx.sendChatAction('upload_video').catch(() => {});
+    await ctx.replyWithVideo(
+      { source: fs.createReadStream(outputPath), filename: `HDVID-${stamp}.mp4` },
+      { caption: '✨ PROSES SELESAI\n\nIni hasil videonya, sudah lebih mulus dan HD.', supports_streaming: true }
+    );
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+  } catch (e) {
+    console.error('[hdvid]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Proses enhance video gagal.\n\nDetail: ' + String(apiError(e)).slice(0, 300)).catch(() => {});
+  } finally {
+    hdvidBusy = false;
+    for (const f of [inputPath, outputPath]) { try { fs.unlinkSync(f); } catch (_) {} }
+  }
+}
+
 // ================= /play (YouTube audio) =================
 // Fitur axcell
 // Fitur SC
@@ -1304,193 +1369,6 @@ async function runPlay(ctx) {
         '\n\nCadangan: ' + String(apiError(e2)).slice(0, 150)).catch(() => {});
     }
   }
-}
-
-// ================= /ambulk (Alight Motion Premium bulk) =================
-const AMBULK_API = process.env.AMBULK_API || 'https://api.nexadev.my.id/am/bulk/';
-const AMBULK_KEY = clean(process.env.AMBULK_KEY) || 'RS-aBk3ue&5';
-
-async function runAmBulk(ctx) {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const input = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
-  const amount = input === '' ? 1 : parseInt(input, 10);
-
-  if (!Number.isInteger(amount) || amount < 1 || amount > 10) {
-    return ctx.reply('⚠️ <b>Jumlah Tidak Valid</b>\n\nKirim angka 1-10.\nContoh: <code>/ambulk 3</code>', { parse_mode: 'HTML' });
-  }
-
-  const wait = await ctx.reply(`⏳ Membuat ${amount} akun Alight Motion Premium...`);
-  try {
-    const { data } = await axios.get(AMBULK_API, {
-      params: { key: AMBULK_KEY, amount },
-      headers: { 'User-Agent': UA },
-      timeout: 30000
-    });
-
-    if (!(data && (data.status || data.success) && Array.isArray(data.data))) {
-      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
-        '❌ Gagal Generate: ' + String((data && data.message) || 'Terjadi kesalahan pada API.').slice(0, 300)).catch(() => {});
-    }
-
-    let out = `✨ <b>ALIGHT MOTION BULK GENERATOR</b> ✨\n\n`;
-    out += `📦 <b>Jumlah Akun:</b> ${data.data.length}\n`;
-    if (data.limit_left !== undefined) out += `🪙 <b>Sisa Limit API:</b> ${escapeHtml(data.limit_left)}\n`;
-    out += `───────────────────\n\n`;
-    data.data.forEach((acc, i) => {
-      out += `<b>${i + 1}. Akun Alight Motion</b>\n`;
-      out += `📧 <b>Email:</b> <code>${escapeHtml(acc.account)}</code>\n`;
-      out += `🔗 <b>Login/Inbox:</b> ${escapeHtml(acc.login_url)}\n`;
-      out += `🌟 <b>Status:</b> ${escapeHtml(acc.status)}\n\n`;
-    });
-    out += `<i>Gunakan URL Login/Inbox di atas untuk memverifikasi akun saat masuk aplikasi!</i>`;
-
-    // batas pesan Telegram 4096 karakter -> pecah per akun jika kepanjangan
-    const chunks = [];
-    let cur = '';
-    for (const part of out.split('\n\n')) {
-      if ((cur + '\n\n' + part).length > 3800) { chunks.push(cur); cur = part; }
-      else cur = cur ? cur + '\n\n' + part : part;
-    }
-    if (cur) chunks.push(cur);
-
-    for (const c of chunks) {
-      await ctx.reply(c, { parse_mode: 'HTML', disable_web_page_preview: true });
-    }
-    await ctx.deleteMessage(wait.message_id).catch(() => {});
-  } catch (e) {
-    console.error('[ambulk]', apiError(e));
-    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
-      '❌ Terjadi Kesalahan: ' + apiError(e).slice(0, 300)).catch(() => {});
-  }
-}
-
-// ================= /imagine (text to image, live3d) =================
-let CryptoJS = null;
-try { CryptoJS = require('crypto-js'); } catch (_) { /* wajib: npm i crypto-js */ }
-
-const L3D = {
-  PUBLIC_KEY: `-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCwlO+boC6cwRo3UfXVBadaYwcX
-0zKS2fuVNY2qZ0dgwb1NJ+/Q9FeAosL4ONiosD71on3PVYqRUlL5045mvH2K9i8b
-AFVMEip7E6RMK6tKAAif7xzZrXnP1GZ5Rijtqdgwh+YmzTo39cuBCsZqK9oEoeQ3
-r/myG9S+9cR5huTuFQIDAQAB
------END PUBLIC KEY-----`,
-  APP_ID: 'aifaceswap',
-  U_ID: '1H5tRtzsBkqXcaJ',
-  FN_NAME: 'demo-ai-body-v1',
-  BRAND_KEY: '8f3f0c7387123ae0',
-  BASE: 'https://app-v1.live3d.io',
-  IMG_BASE: 'https://temp.live3d.io/',
-  THEME: '83EmcUoQTUv50LhNx0VrdcK8rcGexcP35FcZDcpgWsAXEyO4xqL5shCY6sFIWB2Q',
-  MODEL: 'AbsoluteReality_v1.8.1.safetensors'
-};
-// bot ini hanya untuk gambar SFW: prompt eksplisit ditolak & negative prompt selalu menyertakan filter
-const IMAGINE_BLOCK_RE = /\b(nude|nudes|nudity|naked|nsfw|porn\w*|hentai|topless|bugil|telanjang|ngentot|sex\w*|explicit|erotic\w*|genital\w*|nipple\w*|undress\w*)\b/i;
-const IMAGINE_BASE_NEG = '(worst quality, low quality:1.4), deformed, ugly, bad anatomy, extra limbs, nsfw, nude, nudity';
-
-function l3dRandom(len) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let out = '';
-  for (let i = 0; i < len; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
-  return out;
-}
-function l3dAes(data, key) {
-  const k = CryptoJS.enc.Utf8.parse(key);
-  return CryptoJS.AES.encrypt(data, k, { iv: k, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }).toString();
-}
-function l3dRsa(data) {
-  return crypto.publicEncrypt(
-    { key: L3D.PUBLIC_KEY, padding: crypto.constants.RSA_PKCS1_PADDING },
-    Buffer.from(data, 'utf8')
-  ).toString('base64');
-}
-function l3dHeaders(type, fp = null) {
-  const e = new Date();
-  const n = Math.floor(new Date(e.getUTCFullYear(), e.getUTCMonth(), e.getUTCDate(), e.getUTCHours(), e.getUTCMinutes(), e.getUTCSeconds()).getTime() / 1000);
-  const r = crypto.randomUUID();
-  const i = l3dRandom(16);
-  const fingerPrint = fp || crypto.randomBytes(16).toString('hex');
-  const s = l3dRsa(i);
-  const signStr = type === 'upload' ? `${L3D.APP_ID}:${r}:${s}` : `${L3D.APP_ID}:${L3D.U_ID}:${n}:${r}:${s}`;
-  return {
-    fp: fingerPrint,
-    fp1: l3dAes(`${L3D.APP_ID}:${fingerPrint}`, i),
-    'x-guide': s,
-    'x-sign': l3dAes(signStr, i),
-    'x-code': Date.now().toString()
-  };
-}
-
-async function l3dCreate(prompt, negative) {
-  const h = l3dHeaders('create');
-  const payload = {
-    fn_name: L3D.FN_NAME, call_type: 3, data: '',
-    input: { cfg: 7, lora: [], model: L3D.MODEL, negative_prompt: negative, prompt, request_from: 9 },
-    origin_from: L3D.BRAND_KEY, request_from: 9
-  };
-  const res = await axios.post(`${L3D.BASE}/aitools/of/create`, payload, {
-    headers: { 'User-Agent': UA, 'theme-version': L3D.THEME, ...h }, timeout: 30000
-  });
-  if (res.data.code !== 200) throw new Error(res.data.message || 'Gagal membuat job');
-  return { taskId: res.data.data.task_id, fp: h.fp };
-}
-
-async function l3dCheck(taskId, fp) {
-  const h = l3dHeaders('check', fp);
-  const res = await axios.post(`${L3D.BASE}/aitools/of/check-status`, {
-    task_id: taskId, fn_name: L3D.FN_NAME, call_type: 3, request_from: 9, origin_from: L3D.BRAND_KEY
-  }, { headers: { 'User-Agent': UA, 'theme-version': L3D.THEME, ...h }, timeout: 30000 });
-  return res.data.data;
-}
-
-async function generateImagine(prompt, userNegative) {
-  const negative = userNegative ? `${IMAGINE_BASE_NEG}, ${userNegative}` : IMAGINE_BASE_NEG;
-  const { taskId, fp } = await l3dCreate(prompt, negative);
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    const r = await l3dCheck(taskId, fp);
-    if (r && r.status === 2 && r.result_image) return L3D.IMG_BASE + r.result_image;
-    if (r && r.status === 3) throw new Error('Task gagal / diblokir filter keamanan');
-  }
-  throw new Error('Timeout menunggu hasil gambar');
-}
-
-async function runImagine(ctx) {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const raw = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
-  if (!raw) {
-    return ctx.reply('Kirim deskripsi gambar.\nContoh: (masterpiece), 1girl, kimono, cherry blossom\n\nNegative prompt (opsional) pakai tanda |\nprompt | negative prompt');
-  }
-  if (!CryptoJS) return ctx.reply('❌ Modul crypto-js belum terpasang. Jalankan: npm i crypto-js');
-
-  const [prompt, ...negParts] = raw.split('|');
-  const userNeg = negParts.join('|').trim();
-  if (!prompt.trim()) return ctx.reply('❌ Prompt kosong.');
-  if (IMAGINE_BLOCK_RE.test(prompt)) {
-    return ctx.reply('❌ Prompt ditolak: fitur ini hanya untuk gambar non-eksplisit (SFW).');
-  }
-
-  const wait = await ctx.reply('🎨 Membuat gambar, tunggu sekitar 15-60 detik...');
-  // dijalankan terpisah supaya tidak kena handlerTimeout Telegraf (90 detik)
-  (async () => {
-    try {
-      const start = Date.now();
-      await ctx.sendChatAction('upload_photo').catch(() => {});
-      const url = await generateImagine(prompt.trim(), userNeg);
-      await ctx.replyWithPhoto(url, {
-        caption: `🎨 ${prompt.trim().slice(0, 900)}\n⏱️ ${((Date.now() - start) / 1000).toFixed(1)} detik`
-      }).catch(async (e) => {
-        console.error('[imagine url gagal, coba upload manual]', e.message);
-        const dl = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
-        await ctx.replyWithPhoto({ source: Buffer.from(dl.data) }, { caption: `🎨 ${prompt.trim().slice(0, 900)}` });
-      });
-      await ctx.deleteMessage(wait.message_id).catch(() => {});
-    } catch (e) {
-      console.error('[imagine]', apiError(e));
-      await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
-        '❌ Gagal membuat gambar.\n' + apiError(e).slice(0, 200)).catch(() => {});
-    }
-  })();
 }
 
 // ================= /terabox (playterabox) =================
@@ -1699,113 +1577,6 @@ async function runInstagram(ctx) {
     await ctx.reply('❌ Gagal mengambil media Instagram.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
   }
 }
-
-// ================= /nomor (nomor virtual, synoxcloud) =================
-const VN_API = process.env.VN_API || 'https://api.synoxcloud.xyz/tools/virtual-numbers';
-const VN_KEY = process.env.VN_APIKEY || 'FREE';
-const VN_TTL = 10 * 60 * 1000; // cache daftar nomor 10 menit (responsnya besar, ±14.000 nomor)
-const VN_PAGE_SIZE = 12;       // negara per halaman
-const VN_SHOW = 10;            // nomor yang ditampilkan per negara
-let vnCache = { at: 0, total: 0, countries: [] };
-
-async function loadVirtualNumbers() {
-  if (vnCache.countries.length && Date.now() - vnCache.at < VN_TTL) return vnCache;
-  const { data } = await axios.get(VN_API, { params: { apikey: VN_KEY }, timeout: 60000 });
-  const list = data && data.result && data.result.numbers;
-  if (!data || !data.status || !Array.isArray(list) || !list.length) {
-    console.log('[vnum raw]', JSON.stringify(data).slice(0, 300));
-    throw new Error((data && (data.message || data.error)) || 'Daftar nomor kosong');
-  }
-  const map = new Map();
-  for (const n of list) {
-    if (!n || !n.number) continue;
-    const name = n.country || 'Unknown';
-    if (!map.has(name)) map.set(name, { name, flag: n.flag || '🏳️', code: n.countryCode || '', numbers: [] });
-    map.get(name).numbers.push(String(n.number));
-  }
-  const countries = [...map.values()].sort((a, b) => b.numbers.length - a.numbers.length || a.name.localeCompare(b.name));
-  vnCache = { at: Date.now(), total: list.length, countries };
-  return vnCache;
-}
-
-function vnMenuView(cache, page) {
-  const pages = Math.max(1, Math.ceil(cache.countries.length / VN_PAGE_SIZE));
-  page = Math.min(Math.max(0, page), pages - 1);
-  const slice = cache.countries.slice(page * VN_PAGE_SIZE, (page + 1) * VN_PAGE_SIZE);
-  const rows = [];
-  for (let i = 0; i < slice.length; i += 2) {
-    rows.push(slice.slice(i, i + 2).map((c, j) =>
-      Markup.button.callback(`${c.flag} ${c.name} (${c.numbers.length})`.slice(0, 40), `vn_c:${page * VN_PAGE_SIZE + i + j}`)));
-  }
-  const nav = [];
-  if (page > 0) nav.push(Markup.button.callback('⬅️ Prev', `vn_p:${page - 1}`));
-  nav.push(Markup.button.callback(`${page + 1}/${pages}`, `vn_p:${page}`));
-  if (page < pages - 1) nav.push(Markup.button.callback('Next ➡️', `vn_p:${page + 1}`));
-  rows.push(nav);
-  rows.push([Markup.button.callback('⬅️ Menu', 'back_menu')]);
-  return {
-    text: `<b>📱 Nomor Virtual</b>\n${cache.total.toLocaleString('id-ID')} nomor dari ${cache.countries.length} negara.\nPilih negara, atau ketik nama negara (contoh: <code>indonesia</code>):\n\n` +
-      `<i>Ini nomor publik: siapa pun bisa melihat SMS yang masuk, jadi jangan dipakai untuk akun penting.</i>`,
-    kb: Markup.inlineKeyboard(rows)
-  };
-}
-
-function vnCountryView(cache, idx) {
-  const c = cache.countries[idx];
-  if (!c) return null;
-  const pool = [...c.numbers];
-  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-  const picks = pool.slice(0, VN_SHOW);
-  const body = picks.map((n, i) => `${i + 1}. <code>+${escapeHtml(n)}</code>`).join('\n');
-  return {
-    text: `<b>${c.flag} ${escapeHtml(c.name)}</b>${c.code ? ` (+${escapeHtml(c.code)})` : ''}\n${c.numbers.length} nomor tersedia, ${picks.length} acak:\n\n${body}\n\n<i>Ketuk nomor untuk menyalin.</i>`,
-    kb: Markup.inlineKeyboard([
-      [Markup.button.callback('🔄 Acak lagi', `vn_c:${idx}`)],
-      [Markup.button.callback('⬅️ Negara', `vn_p:${Math.floor(idx / VN_PAGE_SIZE)}`), Markup.button.callback('🏠 Menu', 'back_menu')]
-    ])
-  };
-}
-
-async function runNomor(ctx) {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const q = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim().toLowerCase();
-  const wait = await ctx.reply('⏳ Mengambil daftar nomor...');
-  try {
-    const cache = await loadVirtualNumbers();
-    await ctx.deleteMessage(wait.message_id).catch(() => {});
-    let view = null;
-    if (q) {
-      const idx = cache.countries.findIndex((c) => c.name.toLowerCase() === q || c.name.toLowerCase().includes(q) || c.code === q.replace('+', ''));
-      if (idx >= 0) view = vnCountryView(cache, idx);
-      else await ctx.reply(`❌ Negara "${q}" tidak ditemukan, pilih dari daftar:`);
-    }
-    if (!view) view = vnMenuView(cache, 0);
-    await ctx.reply(view.text, { parse_mode: 'HTML', ...view.kb });
-  } catch (e) {
-    console.error('[vnum]', apiError(e));
-    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Gagal mengambil nomor.\n' + apiError(e).slice(0, 200)).catch(() => {});
-  }
-}
-
-async function vnAction(ctx, build) {
-  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
-  try {
-    const cache = await loadVirtualNumbers();
-    const view = build(cache) || vnMenuView(cache, 0);
-    await ctx.answerCbQuery();
-    await safeEdit(ctx, view.text, view.kb);
-  } catch (e) {
-    console.error('[vnum action]', apiError(e));
-    await ctx.answerCbQuery('❌ Gagal memuat').catch(() => {});
-  }
-}
-bot.action('vn_menu', (ctx) => {
-  ctx.session.waitingForUrl = false;
-  ctx.session.step = 'in_nomor';
-  return vnAction(ctx, (cache) => vnMenuView(cache, 0));
-});
-bot.action(/^vn_p:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnMenuView(cache, Number(ctx.match[1]))));
-bot.action(/^vn_c:(\d+)$/, (ctx) => vnAction(ctx, (cache) => vnCountryView(cache, Number(ctx.match[1]))));
 
 // ================= /fb (Facebook downloader, fget + wayin metadata) =================
 const FB_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36';
@@ -2218,10 +1989,10 @@ async function runWizardStep(ctx) {
 const INPUT_FLOWS = {
   play: { icon: '🎵', title: 'Play Musik', run: runPlay,
     hint: 'Kirim judul lagu atau link YouTube.\nContoh: <code>dewa 19 kangen</code>' },
-  ambulk: { icon: '⭐', title: 'AM Premium Bulk', run: runAmBulk,
-    hint: 'Kirim jumlah akun yang mau dibuat (1-10).\nContoh: <code>3</code>' },
   hd: { icon: '🖼', title: 'HD Foto (Upscale)', run: runHd,
     hint: 'Kirim foto yang mau di-upscale jadi HD (sebagai foto atau file gambar).' },
+  hdvid: { icon: '📹', title: 'HD Video (Enhance)', run: runHdVid,
+    hint: 'Kirim video yang mau di-enhance jadi HD (sebagai video atau file video, maks 20 MB).' },
   ig: { icon: '📸', title: 'Instagram Downloader', run: runInstagram,
     hint: 'Kirim link Instagram (post, reel, atau story).\nContoh: <code>https://www.instagram.com/reel/xxxx/</code>' },
   tiktok: { icon: '🎬', title: 'TikTok Downloader', run: runTikTok,
@@ -2231,9 +2002,7 @@ const INPUT_FLOWS = {
   fb: { icon: '📘', title: 'Facebook Downloader', run: runFacebook,
     hint: 'Kirim link video Facebook.\nContoh: <code>https://www.facebook.com/share/r/xxxx/</code>' },
   terabox: { icon: '📦', title: 'Terabox Downloader', run: runTerabox,
-    hint: 'Kirim link Terabox.\nContoh: <code>https://1024terabox.com/s/1xxxxxxxx</code>' },
-  imagine: { icon: '🎨', title: 'Buat Gambar (SFW)', run: runImagine,
-    hint: 'Kirim deskripsi gambar (bahasa Inggris biasanya lebih bagus).\nContoh: <code>(masterpiece), 1girl, kimono, cherry blossom</code>\n\nNegative prompt opsional, pisahkan dengan <code>|</code>:\n<code>prompt | negative prompt</code>' }
+    hint: 'Kirim link Terabox.\nContoh: <code>https://1024terabox.com/s/1xxxxxxxx</code>' }
 };
 
 bot.action(/^flow_(\w+)$/, async (ctx) => {
@@ -2249,8 +2018,14 @@ bot.action(/^flow_(\w+)$/, async (ctx) => {
 });
 
 // foto/file gambar -> hanya diproses saat mode HD Foto aktif
-bot.on(['photo', 'document'], async (ctx) => {
+bot.on(['photo', 'document', 'video', 'animation'], async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
+  // video dengan caption /hdvid langsung diproses, atau saat mode HD Video aktif
+  if (hdvidFileOf(ctx.message)) {
+    if (/^\/(hdvid|hdvideo|enhancevid|hdv)(@\w+)?(\s|$)/i.test(ctx.message.caption || '')) ctx.session.step = 'in_hdvid';
+    if (ctx.session.step === 'in_hdvid') return runHdVid(ctx);
+  }
+  if (!ctx.message.photo && !ctx.message.document) return;
   // foto dengan caption /hd langsung diproses
   if (/^\/hd(@\w+)?(\s|$)/i.test(ctx.message.caption || '')) {
     ctx.session.step = 'in_hd';
@@ -2283,7 +2058,7 @@ async function runAiChat(ctx, prompt) {
 const CMD_FLOWS = [
   [['play'], 'play'], [['hd'], 'hd'], [['ig', 'instagram', 'igdl'], 'ig'], [['fb', 'facebook', 'fbdl'], 'fb'],
   [['tiktok', 'tt'], 'tiktok'], [['spotify', 'spotifydl'], 'spotify'], [['terabox', 'tera'], 'terabox'],
-  [['imagine', 'txt2img'], 'imagine'], [['ambulk', 'amremlist', 'bulkam', 'ambulkgen'], 'ambulk']
+  [['hdvid', 'hdvideo', 'enhancevid', 'hdv'], 'hdvid']
 ];
 for (const [names, key] of CMD_FLOWS) {
   bot.command(names, async (ctx) => {
@@ -2294,6 +2069,9 @@ for (const [names, key] of CMD_FLOWS) {
     if (key === 'hd') {
       const rp = ctx.message.reply_to_message;
       if (rp && (rp.photo || (rp.document && /^image\//i.test(rp.document.mime_type || '')))) return runHd(ctx, rp);
+    } else if (key === 'hdvid') {
+      const rp = ctx.message.reply_to_message;
+      if (hdvidFileOf(rp)) return runHdVid(ctx, rp);
     } else if (argOf(ctx)) {
       return flow.run(ctx);
     }
@@ -2301,13 +2079,6 @@ for (const [names, key] of CMD_FLOWS) {
       { parse_mode: 'HTML', ...wizKb });
   });
 }
-
-bot.command(['nomor', 'vnum', 'virtualnumber'], async (ctx) => {
-  if (!adminOnly(ctx)) return;
-  ctx.session.waitingForUrl = false;
-  ctx.session.step = 'in_nomor';
-  return runNomor(ctx);
-});
 
 bot.command('ai', async (ctx) => {
   if (!adminOnly(ctx)) return;
@@ -2371,19 +2142,19 @@ bot.command('help', async (ctx) => {
 const CMD_MENU = [
   ['play', 'Cari & kirim lagu YouTube'], ['hd', 'Upscale foto jadi HD (reply foto)'],
   ['ig', 'Download Instagram'], ['fb', 'Download Facebook'], ['tiktok', 'Download TikTok'],
-  ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['imagine', 'Buat gambar dari teks (SFW)'], ['ambulk', 'Bulk akun Alight Motion Premium'],
-  ['nomor', 'Nomor virtual publik'], ['ai', 'Ngobrol dengan AI'], ['coder', 'AI Coder (bikin kode)'],
+  ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['hdvid', 'Enhance video jadi HD (reply video)'],
+  ['ai', 'Ngobrol dengan AI'], ['coder', 'AI Coder (bikin kode)'],
   ['idcard', 'Buat ID Card'], ['spcard', 'Buat Spotify Card'], ['menu', 'Buka menu utama'], ['help', 'Bantuan']
 ].map(([command, description]) => ({ command, description }));
 
 bot.on('text', async (ctx) => {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
 
-  // ---- fitur dari tombol menu (play, ig, fb, terabox, imagine, nomor, hd) ----
+  // ---- fitur dari tombol menu (play, ig, fb, terabox, hd) ----
   const stepName = typeof ctx.session.step === 'string' && ctx.session.step.startsWith('in_') ? ctx.session.step.slice(3) : null;
   if (ctx.session.step === 'wiz') return runWizardStep(ctx);
-  if (stepName === 'nomor') return runNomor(ctx);
   if (stepName === 'hd') return ctx.reply('🖼 Kirim fotonya (bukan teks) ya.');
+  if (stepName === 'hdvid') return ctx.reply('📹 Kirim videonya (bukan teks) ya.');
   if (stepName && INPUT_FLOWS[stepName]) return INPUT_FLOWS[stepName].run(ctx);
 
   // ---- alur Fake ML: username & avatar ----
