@@ -1275,7 +1275,6 @@ async function runImagine(ctx) {
 const TERA_SALT = 'T9do@SM1?xGn5';
 const TERA_PATH = '/api/stream.php';
 const TERA_MAX_FILES = 5;          // maksimal file yang ditampilkan per link
-const TERA_TG_URL_LIMIT = 20 * 1024 * 1024; // Telegram hanya mau ambil video dari URL jika <= 20MB
 
 function teraToken(ts) {
   return crypto.createHash('md5').update(TERA_SALT + ts + TERA_PATH).digest('hex');
@@ -1356,10 +1355,11 @@ async function runTerabox(ctx) {
       const kb = buttons.length ? Markup.inlineKeyboard(buttons) : {};
 
       // file kecil: coba kirim langsung sebagai video; kalau gagal, jatuh ke kartu info + tombol link
-      if (isHttp(dl) && f.sizeBytes > 0 && f.sizeBytes <= TERA_TG_URL_LIMIT) {
+      const teraSize = f.sizeBytes || (isHttp(dl) ? await urlSize(dl) : null);
+      if (isHttp(dl) && (!teraSize || teraSize <= TG_UPLOAD_LIMIT)) {
         try {
           await ctx.sendChatAction('upload_video').catch(() => {});
-          await ctx.replyWithVideo(dl, { caption, supports_streaming: true, ...kb });
+          await sendMediaSmart(ctx, 'video', dl, { caption, supports_streaming: true, ...kb }, (f.name || 'terabox').replace(/[^\w.\- ]+/g, '_').slice(0, 80));
           continue;
         } catch (e) {
           console.error('[terabox kirim langsung gagal]', e.message);
@@ -1703,11 +1703,12 @@ async function runFacebook(ctx) {
       [Markup.button.url(`⬇️ ${d.quality}${d.type ? ` (${d.type})` : ''}`.slice(0, 40), d.url)]));
 
     // coba kirim langsung (butuh file <= 20MB); kalau gagal, kartu info + tombol download
-    const direct = dls.find((d) => !/mp3|audio/i.test(d.type + d.quality));
+    const candidates = dls.filter((d) => !/mp3|audio/i.test(d.type + d.quality));
+    const direct = await pickDownloadable(candidates);
     if (direct) {
       try {
         await ctx.sendChatAction('upload_video').catch(() => {});
-        await ctx.replyWithVideo(direct.url, { caption, supports_streaming: true, ...kb, ...replyOpt });
+        await sendMediaSmart(ctx, 'video', direct.url, { caption, supports_streaming: true, ...kb, ...replyOpt }, 'facebook.mp4');
         return;
       } catch (e) {
         console.error('[fb kirim langsung gagal]', e.message);
@@ -1725,11 +1726,69 @@ async function runFacebook(ctx) {
   }
 }
 
+// ================= Pengiriman media langsung (video/audio/foto) =================
+const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // batas upload bot Telegram biasa
+const DL_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36';
+
+async function urlSize(url) {
+  try {
+    const r = await axios.head(url, { timeout: 15000, maxRedirects: 5, headers: { 'User-Agent': DL_UA } });
+    const n = Number(r.headers['content-length']);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch (_) { return null; }
+}
+
+// dari beberapa kualitas, pilih yang terbesar tapi masih muat di Telegram (<= 50MB)
+async function pickDownloadable(items) {
+  const sized = await Promise.all(items.map(async (it) => ({ it, size: await urlSize(it.url) })));
+  const fit = sized.filter((x) => x.size && x.size <= TG_UPLOAD_LIMIT).sort((a, b) => b.size - a.size);
+  if (fit.length) return fit[0].it;
+  const unknown = sized.find((x) => !x.size); // ukuran tidak diketahui -> coba saja
+  return unknown ? unknown.it : null;         // semua > 50MB
+}
+
+// kirim lewat URL dulu (cepat); kalau Telegram gagal, bot unduh sendiri lalu upload (maks 50MB)
+async function sendMediaSmart(ctx, kind, url, opts = {}, filename = 'media') {
+  const method = { video: 'replyWithVideo', audio: 'replyWithAudio', photo: 'replyWithPhoto' }[kind];
+  try {
+    return await ctx[method](url, opts);
+  } catch (e) {
+    console.error(`[kirim ${kind} via URL gagal, unduh manual]`, e.message);
+  }
+  const dl = await axios.get(url, {
+    responseType: 'arraybuffer', timeout: 180000,
+    maxContentLength: TG_UPLOAD_LIMIT, maxBodyLength: TG_UPLOAD_LIMIT,
+    headers: { 'User-Agent': DL_UA }
+  });
+  const buf = Buffer.from(dl.data);
+  try {
+    return await ctx[method]({ source: buf, filename }, opts);
+  } catch (e2) {
+    console.error(`[upload ${kind} gagal, kirim sebagai dokumen]`, e2.message);
+    const { caption, reply_markup, reply_to_message_id } = opts;
+    return ctx.replyWithDocument({ source: buf, filename }, { caption, reply_markup, reply_to_message_id });
+  }
+}
+
 // ================= TikTok downloader (synoxcloud) =================
 const TT_API = process.env.TIKTOK_API || 'https://api.synoxcloud.xyz/download/tiktok';
 const TT_KEY = process.env.SYNOX_APIKEY || process.env.VN_APIKEY || 'FREE';
 const TT_URL_RE = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/i;
-const TT_MAX_BYTES = 50 * 1024 * 1024;
+
+async function sendTikTokMusic(ctx, music, r, replyOpt) {
+  if (!music) return;
+  try {
+    await ctx.sendChatAction('upload_voice').catch(() => {});
+    await sendMediaSmart(ctx, 'audio', music.url, {
+      title: String(r.title || 'TikTok').slice(0, 100),
+      performer: r.author && r.author !== 'Unknown' ? String(r.author).slice(0, 100) : 'TikTok',
+      ...replyOpt
+    }, 'tiktok.mp3');
+  } catch (e) {
+    console.error('[tiktok mp3]', e.message);
+    await ctx.reply('🎵 MP3 tidak bisa dikirim langsung:', { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download MP3', music.url)]]), ...replyOpt }).catch(() => {});
+  }
+}
 
 async function runTikTok(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
@@ -1765,29 +1824,23 @@ async function runTikTok(ctx) {
         const kb = Markup.inlineKeyboard(images.slice(0, 8).map((d, i) => [Markup.button.url(`🖼 Foto ${i + 1}`, d.url)]));
         await ctx.reply(caption, { ...kb, ...replyOpt });
       });
-      if (music) await ctx.reply('🎵 Musiknya:', { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download MP3', music.url)]]), ...replyOpt });
+      await sendTikTokMusic(ctx, music, r, replyOpt);
       return;
     }
 
     if (!videos.length) throw new Error('Tidak ada video di hasil');
-    const buttons = [];
-    if (videos[1]) buttons.push([Markup.button.url('⬇️ Video (alternatif)', videos[1].url)]);
-    if (music) buttons.push([Markup.button.url('🎵 Download MP3', music.url)]);
-    const kb = buttons.length ? Markup.inlineKeyboard(buttons) : {};
+    const altKb = videos[1] ? Markup.inlineKeyboard([[Markup.button.url('⬇️ Video (alternatif)', videos[1].url)]]) : {};
 
     await ctx.sendChatAction('upload_video').catch(() => {});
     try {
-      await ctx.replyWithVideo(videos[0].url, { caption, supports_streaming: true, ...kb, ...replyOpt });
+      await sendMediaSmart(ctx, 'video', videos[0].url, { caption, supports_streaming: true, ...altKb, ...replyOpt }, 'tiktok.mp4');
     } catch (e) {
-      console.error('[tiktok kirim via URL gagal, unduh manual]', e.message);
-      const dl = await axios.get(videos[0].url, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: TT_MAX_BYTES });
-      const buf = Buffer.from(dl.data);
-      try {
-        await ctx.replyWithVideo({ source: buf, filename: 'tiktok.mp4' }, { caption, supports_streaming: true, ...kb, ...replyOpt });
-      } catch (e2) {
-        await ctx.replyWithDocument({ source: buf, filename: 'tiktok.mp4' }, { caption, ...kb, ...replyOpt });
-      }
+      console.error('[tiktok video]', e.message);
+      const btns = videos.slice(0, 2).map((v, i) => [Markup.button.url(`⬇️ Video ${i + 1}`, v.url)]);
+      await ctx.reply(`${caption}\n\n⚠️ Video tidak bisa dikirim lewat Telegram (terlalu besar), pakai tombol download.`,
+        { ...Markup.inlineKeyboard(btns), ...replyOpt });
     }
+    await sendTikTokMusic(ctx, music, r, replyOpt);
   } catch (e) {
     console.error('[tiktok]', apiError(e));
     await removeWait();
