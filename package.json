@@ -1,21 +1,21 @@
 {
-  "name": "am-preset-bot",
+  "name": "telegram-multi-bot",
   "version": "1.0.0",
-  "description": "Bot Telegram multifungsi: downloader (IG, FB, TikTok, Spotify, Terabox), AI Chat, AI Coder, HD foto, dan lainnya",
-  "main": "index.js",
+  "description": "Bot Telegram multifungsi (Play musik, downloader, AI, AM Premium, dll)",
+  "main": "index1.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index1.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
-  "license": "ISC",
   "dependencies": {
     "axios": "^1.7.9",
     "cheerio": "^1.0.0",
     "crypto-js": "^4.2.0",
     "dotenv": "^16.4.7",
-    "telegraf": "^4.16.3"
-  }
+    "telegraf": "^4.16.3",
+    "yt-search": "^2.12.1"
+  },
+  "license": "ISC"
 }
