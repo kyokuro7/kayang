@@ -696,8 +696,9 @@ const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🎮 Fake ML', 'fake_ml'), Markup.button.callback('🎵 Play Musik', 'flow_play')],
   [Markup.button.callback('🖼 HD Foto', 'flow_hd'), Markup.button.callback('📸 Instagram', 'flow_ig')],
   [Markup.button.callback('📘 Facebook', 'flow_fb'), Markup.button.callback('🎬 TikTok', 'flow_tiktok')],
-  [Markup.button.callback('📦 Terabox', 'flow_terabox'), Markup.button.callback('🎨 Buat Gambar', 'flow_imagine')],
-  [Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
+  [Markup.button.callback('🎧 Spotify', 'flow_spotify'), Markup.button.callback('📦 Terabox', 'flow_terabox')],
+  [Markup.button.callback('🎨 Buat Gambar', 'flow_imagine'), Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
+  [Markup.button.callback('🪪 ID Card', 'wiz_idcard'), Markup.button.callback('🎵 Spotify Card', 'wiz_spcard')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
 
@@ -763,6 +764,8 @@ bot.action('help', async (ctx) => {
     `<b>🖼 HD Foto</b>: kirim foto, bot upscale jadi HD.\n` +
     `<b>📸 Instagram</b>: download foto/video/reel (HD jika tersedia).\n` +
     `<b>🎬 TikTok</b>: download video atau slideshow foto, plus link MP3-nya.\n` +
+    `<b>🎧 Spotify</b>: kirim link lagu, pilih MP3 atau cover.\n` +
+    `<b>🪪 ID Card</b> &amp; <b>🎵 Spotify Card</b>: buat kartu gambar, bot menanyakan datanya satu per satu.\n` +
     `<b>📘 Facebook</b>: download video lengkap dengan metadata (butuh <code>npm i cheerio</code>).\n` +
     `<b>📦 Terabox</b>: ambil link download HD &amp; stream.\n` +
     `<b>🎨 Buat Gambar</b>: gambar dari teks, khusus SFW (butuh <code>npm i crypto-js</code>).\n` +
@@ -1346,31 +1349,18 @@ async function runTerabox(ctx) {
       ].filter(Boolean);
       const caption = lines.join('\n').slice(0, 1000);
 
-      const buttons = [];
-      const dl = f.downloadLink || f.normalDlink;
-      if (isHttp(f.downloadLink)) buttons.push([Markup.button.url('⬇️ Download HD', f.downloadLink)]);
-      if (isHttp(f.normalDlink) && f.normalDlink !== f.downloadLink) buttons.push([Markup.button.url('⬇️ Download Normal', f.normalDlink)]);
-      if (isHttp(f.fastStreamUrl)) buttons.push([Markup.button.url('▶️ Stream', f.fastStreamUrl)]);
-      if (isHttp(f.subtitleUrl)) buttons.push([Markup.button.url('💬 Subtitle', f.subtitleUrl)]);
-      const kb = buttons.length ? Markup.inlineKeyboard(buttons) : {};
-
-      // file kecil: coba kirim langsung sebagai video; kalau gagal, jatuh ke kartu info + tombol link
-      const teraSize = f.sizeBytes || (isHttp(dl) ? await urlSize(dl) : null);
-      if (isHttp(dl) && (!teraSize || teraSize <= TG_UPLOAD_LIMIT)) {
-        try {
-          await ctx.sendChatAction('upload_video').catch(() => {});
-          await sendMediaSmart(ctx, 'video', dl, { caption, supports_streaming: true, ...kb }, (f.name || 'terabox').replace(/[^\w.\- ]+/g, '_').slice(0, 80));
-          continue;
-        } catch (e) {
-          console.error('[terabox kirim langsung gagal]', e.message);
-        }
+      const fname = (f.name || 'terabox').replace(/[^\w.\- ]+/g, '_').slice(0, 80);
+      const options = [];
+      if (isHttp(f.downloadLink)) options.push({ kind: 'video', label: '🎬 HD', url: f.downloadLink, size: f.sizeBytes || 0, filename: fname });
+      if (isHttp(f.normalDlink) && f.normalDlink !== f.downloadLink) options.push({ kind: 'video', label: '🎬 Normal', url: f.normalDlink, filename: fname });
+      const extra = [];
+      if (isHttp(f.fastStreamUrl)) extra.push([Markup.button.url('▶️ Stream', f.fastStreamUrl)]);
+      if (isHttp(f.subtitleUrl)) extra.push([Markup.button.url('💬 Subtitle', f.subtitleUrl)]);
+      if (!options.length) {
+        await ctx.reply(`${caption}\n\n⚠️ Link download tidak tersedia.`, extra.length ? Markup.inlineKeyboard(extra) : {});
+        continue;
       }
-
-      if (isHttp(f.thumbnail)) {
-        const ok = await ctx.replyWithPhoto(f.thumbnail, { caption, ...kb }).then(() => true).catch(() => false);
-        if (ok) continue;
-      }
-      await ctx.reply(caption, kb);
+      await showDownloadMenu(ctx, { caption, thumbnail: f.thumbnail, options, extraRows: extra });
     }
 
     if (r.files.length > shown.length) {
@@ -1387,7 +1377,6 @@ async function runTerabox(ctx) {
 const IG_BASE = process.env.IG_BASE || 'https://igexport.com';
 const IG_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36';
 const IG_MAX_MEDIA = 10;
-const IG_MAX_BYTES = 50 * 1024 * 1024;
 
 const igEndpoint = (url) => (/\/(reel|reels|tv|stories)\//i.test(url) ? '/api/ig-reels' : '/api/ig-photo');
 
@@ -1436,37 +1425,13 @@ function pickIgMedia(data, endpoint) {
     items.push({ url, type: isVideo ? 'video' : 'photo', hd: /hd|high|1080|original/i.test(key + url) });
   }
   if (endpoint === '/api/ig-reels') {
-    // reel = 1 video; kalau ada beberapa kualitas, utamakan yang berlabel HD
-    const vids = items.filter((i) => i.type === 'video');
-    const best = vids.find((v) => v.hd) || vids[0];
-    return best ? [best] : items.slice(0, 1);
+    // reel: tampilkan sampai 3 pilihan video, yang berlabel HD di depan
+    const vids = items.filter((i) => i.type === 'video').sort((a, b) => (b.hd ? 1 : 0) - (a.hd ? 1 : 0));
+    return (vids.length ? vids : items).slice(0, 3);
   }
   const videos = items.filter((i) => i.type === 'video');
   const photos = items.filter((i) => i.type === 'photo');
   return [...photos, ...videos].slice(0, IG_MAX_MEDIA);
-}
-
-async function sendIgMedia(ctx, item, caption, replyOpt) {
-  const send = (src, extra = {}) => (item.type === 'video'
-    ? ctx.replyWithVideo(src, { caption, supports_streaming: true, ...replyOpt, ...extra })
-    : ctx.replyWithPhoto(src, { caption, ...replyOpt, ...extra }));
-  try {
-    return await send(item.url);
-  } catch (e) {
-    console.error('[ig kirim via URL gagal, unduh manual]', e.message);
-    const dl = await axios.get(item.url, {
-      responseType: 'arraybuffer', timeout: 120000, maxContentLength: IG_MAX_BYTES,
-      headers: { 'User-Agent': IG_UA, Referer: 'https://www.instagram.com/' }
-    });
-    const buf = Buffer.from(dl.data);
-    const filename = item.type === 'video' ? 'instagram.mp4' : 'instagram.jpg';
-    try {
-      return await send({ source: buf, filename });
-    } catch (e2) {
-      // terlalu besar / format tidak cocok -> kirim sebagai dokumen
-      return ctx.replyWithDocument({ source: buf, filename }, { caption, ...replyOpt });
-    }
-  }
 }
 
 async function runInstagram(ctx) {
@@ -1493,11 +1458,22 @@ async function runInstagram(ctx) {
     }
 
     await removeWait();
-    await ctx.sendChatAction(media[0].type === 'video' ? 'upload_video' : 'upload_photo').catch(() => {});
-    for (let i = 0; i < media.length; i++) {
-      const cap = i === 0 ? `📸 Instagram${media.length > 1 ? ` (${media.length} media)` : ''}\n🔗 ${m[0]}`.slice(0, 1000) : undefined;
-      await sendIgMedia(ctx, media[i], cap, replyOpt);
-    }
+    const isReel = endpoint === '/api/ig-reels';
+    const many = media.length > 1;
+    const options = [];
+    if (!isReel && many) options.push({ kind: 'all', label: `📦 Semua (${media.length})`, items: media });
+    media.slice(0, isReel ? 3 : 8).forEach((it, i) => {
+      if (it.type === 'video') {
+        const tag = isReel && it.hd ? ' HD' : many ? ` ${i + 1}` : '';
+        options.push({ kind: 'video', label: `🎬 Video${tag}`, url: it.url, filename: 'instagram.mp4' });
+      } else {
+        options.push({ kind: 'photo', label: `🖼 Foto${many ? ` ${i + 1}` : ''}`, url: it.url, filename: 'instagram.jpg' });
+      }
+    });
+    const thumb = (collectUrls(data).find(({ key, url }) => /thumb|cover|preview|poster/i.test(key) && /\.(jpe?g|png|webp)/i.test(url)) || {}).url
+      || (media.find((x) => x.type === 'photo') || {}).url;
+    const caption = `📸 Instagram${many && !isReel ? ` (${media.length} media)` : ''}\n🔗 ${m[0]}`;
+    await showDownloadMenu(ctx, { caption, thumbnail: thumb, options, replyOpt });
   } catch (e) {
     console.error('[ig]', apiError(e));
     await removeWait();
@@ -1699,26 +1675,17 @@ async function runFacebook(ctx) {
     const caption = lines.join('\n').slice(0, 1000);
 
     const dls = links.downloads.filter((d) => /^https?:\/\//i.test(d.url) && d.url.length <= 2000).slice(0, 8);
-    const kb = Markup.inlineKeyboard(dls.map((d) =>
-      [Markup.button.url(`⬇️ ${d.quality}${d.type ? ` (${d.type})` : ''}`.slice(0, 40), d.url)]));
-
-    // coba kirim langsung (butuh file <= 20MB); kalau gagal, kartu info + tombol download
-    const candidates = dls.filter((d) => !/mp3|audio/i.test(d.type + d.quality));
-    const direct = await pickDownloadable(candidates);
-    if (direct) {
-      try {
-        await ctx.sendChatAction('upload_video').catch(() => {});
-        await sendMediaSmart(ctx, 'video', direct.url, { caption, supports_streaming: true, ...kb, ...replyOpt }, 'facebook.mp4');
-        return;
-      } catch (e) {
-        console.error('[fb kirim langsung gagal]', e.message);
-      }
-    }
-    if (links.thumbnail && /^https?:\/\//i.test(links.thumbnail)) {
-      const ok = await ctx.replyWithPhoto(links.thumbnail, { caption, ...kb, ...replyOpt }).then(() => true).catch(() => false);
-      if (ok) return;
-    }
-    await ctx.reply(caption, { ...kb, ...replyOpt });
+    const options = dls.map((d) => {
+      const isAudio = /mp3|audio/i.test(`${d.type} ${d.quality}`);
+      return {
+        kind: isAudio ? 'audio' : 'video',
+        label: `${isAudio ? '🎵' : '🎬'} ${d.quality}${!isAudio && d.type ? ` (${d.type})` : ''}`,
+        url: d.url,
+        filename: isAudio ? 'facebook.mp3' : 'facebook.mp4',
+        meta: { title: (meta && meta.title) || 'Facebook', performer: (meta && meta.author) || 'Facebook' }
+      };
+    });
+    await showDownloadMenu(ctx, { caption, thumbnail: links.thumbnail, options, replyOpt });
   } catch (e) {
     console.error('[fb]', apiError(e));
     await removeWait();
@@ -1736,15 +1703,6 @@ async function urlSize(url) {
     const n = Number(r.headers['content-length']);
     return Number.isFinite(n) && n > 0 ? n : null;
   } catch (_) { return null; }
-}
-
-// dari beberapa kualitas, pilih yang terbesar tapi masih muat di Telegram (<= 50MB)
-async function pickDownloadable(items) {
-  const sized = await Promise.all(items.map(async (it) => ({ it, size: await urlSize(it.url) })));
-  const fit = sized.filter((x) => x.size && x.size <= TG_UPLOAD_LIMIT).sort((a, b) => b.size - a.size);
-  if (fit.length) return fit[0].it;
-  const unknown = sized.find((x) => !x.size); // ukuran tidak diketahui -> coba saja
-  return unknown ? unknown.it : null;         // semua > 50MB
 }
 
 // kirim lewat URL dulu (cepat); kalau Telegram gagal, bot unduh sendiri lalu upload (maks 50MB)
@@ -1770,25 +1728,104 @@ async function sendMediaSmart(ctx, kind, url, opts = {}, filename = 'media') {
   }
 }
 
+// ================= Menu pilihan download (tombol) =================
+// Bot menampilkan tombol pilihan (MP3 / resolusi video) dulu; file baru dikirim setelah tombol ditekan.
+const DL_CACHE = new Map();
+const DL_TTL = 30 * 60 * 1000;
+
+const fmtBytes = (n) => (n >= 1073741824 ? `${(n / 1073741824).toFixed(1)} GB`
+  : n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
+  : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+function dlStore(entry) {
+  const now = Date.now();
+  for (const [k, v] of DL_CACHE) if (now - v.at > DL_TTL) DL_CACHE.delete(k);
+  while (DL_CACHE.size >= 300) DL_CACHE.delete(DL_CACHE.keys().next().value);
+  let id;
+  do { id = crypto.randomBytes(4).toString('hex'); } while (DL_CACHE.has(id));
+  DL_CACHE.set(id, { ...entry, at: now });
+  return id;
+}
+
+async function showDownloadMenu(ctx, { caption, thumbnail, options, replyOpt = {}, extraRows = [] }) {
+  // ukuran tiap pilihan ditampilkan di tombol (kalau server memberi tahu)
+  await Promise.all(options.map(async (o) => { if (!o.size && o.url) o.size = await urlSize(o.url); }));
+  const id = dlStore({ options, caption });
+  const btns = options.map((o, i) => Markup.button.callback(
+    `${o.label}${o.size ? ` • ${fmtBytes(o.size)}` : ''}${o.size > TG_UPLOAD_LIMIT ? ' ⚠️' : ''}`.slice(0, 40), `dl:${id}:${i}`));
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 2) rows.push(btns.slice(i, i + 2));
+  rows.push(...extraRows);
+  const kb = Markup.inlineKeyboard(rows);
+  const text = `${caption.slice(0, 940)}\n\n👇 Pilih yang mau dikirim:`;
+  if (typeof thumbnail === 'string' && /^https?:\/\//i.test(thumbnail)) {
+    const ok = await ctx.replyWithPhoto(thumbnail, { caption: text, ...kb, ...replyOpt }).then(() => true).catch(() => false);
+    if (ok) return;
+  }
+  await ctx.reply(text, { ...kb, ...replyOpt });
+}
+
+bot.action(/^dl:([0-9a-f]+):(\d+)$/, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  const entry = DL_CACHE.get(ctx.match[1]);
+  const opt = entry && entry.options[Number(ctx.match[2])];
+  if (!opt) return ctx.answerCbQuery('Pilihan sudah kedaluwarsa, kirim ulang linknya.', { show_alert: true });
+  if (opt.sending) return ctx.answerCbQuery('⏳ Masih dikirim...');
+  opt.sending = true;
+  await ctx.answerCbQuery(`⏳ Mengirim ${opt.label}`.slice(0, 60)).catch(() => {});
+
+  const replyTo = ctx.callbackQuery && ctx.callbackQuery.message ? ctx.callbackQuery.message.message_id : undefined;
+  const base = replyTo ? { reply_to_message_id: replyTo } : {};
+  try {
+    if (opt.kind === 'album') {
+      await ctx.sendChatAction('upload_photo').catch(() => {});
+      const group = opt.urls.map((u, i) => ({ type: 'photo', media: u, ...(i === 0 ? { caption: entry.caption.slice(0, 1000) } : {}) }));
+      try {
+        await ctx.replyWithMediaGroup(group, base);
+      } catch (e) {
+        console.error('[album gagal]', e.message);
+        const rows = opt.urls.slice(0, 8).map((u, i) => [Markup.button.url(`🖼 Foto ${i + 1}`, u)]);
+        await ctx.reply('⚠️ Album tidak bisa dikirim langsung. Link foto:', { ...Markup.inlineKeyboard(rows), ...base });
+      }
+    } else if (opt.kind === 'photo') {
+      await ctx.sendChatAction('upload_photo').catch(() => {});
+      await sendMediaSmart(ctx, 'photo', opt.url, { caption: entry.caption.slice(0, 1000), ...base }, opt.filename || 'photo.jpg');
+    } else if (opt.kind === 'all') {
+      for (const it of opt.items) {
+        const kind = it.type === 'video' ? 'video' : 'photo';
+        try {
+          await ctx.sendChatAction(kind === 'video' ? 'upload_video' : 'upload_photo').catch(() => {});
+          await sendMediaSmart(ctx, kind, it.url, { ...base }, kind === 'video' ? 'instagram.mp4' : 'instagram.jpg');
+        } catch (e) {
+          console.error('[dl all]', apiError(e));
+          await ctx.reply('⚠️ Satu file tidak bisa dikirim langsung. Link download:',
+            { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download', it.url)]]), ...base }).catch(() => {});
+        }
+      }
+    } else if (opt.kind === 'audio') {
+      await ctx.sendChatAction('upload_voice').catch(() => {});
+      await sendMediaSmart(ctx, 'audio', opt.url, {
+        title: (opt.meta && opt.meta.title) || 'Audio', performer: (opt.meta && opt.meta.performer) || undefined, ...base
+      }, opt.filename || 'audio.mp3');
+    } else {
+      await ctx.sendChatAction('upload_video').catch(() => {});
+      await sendMediaSmart(ctx, 'video', opt.url, {
+        caption: entry.caption.slice(0, 1000), supports_streaming: true, ...base
+      }, opt.filename || 'video.mp4');
+    }
+  } catch (e) {
+    console.error('[dl]', apiError(e));
+    await ctx.reply('⚠️ Tidak bisa dikirim lewat Telegram (kemungkinan lebih dari 50MB). Link download:',
+      { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download', opt.url)]]), ...base }).catch(() => {});
+  } finally {
+    opt.sending = false;
+  }
+});
+
 // ================= TikTok downloader (synoxcloud) =================
 const TT_API = process.env.TIKTOK_API || 'https://api.synoxcloud.xyz/download/tiktok';
 const TT_KEY = process.env.SYNOX_APIKEY || process.env.VN_APIKEY || 'FREE';
 const TT_URL_RE = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/i;
-
-async function sendTikTokMusic(ctx, music, r, replyOpt) {
-  if (!music) return;
-  try {
-    await ctx.sendChatAction('upload_voice').catch(() => {});
-    await sendMediaSmart(ctx, 'audio', music.url, {
-      title: String(r.title || 'TikTok').slice(0, 100),
-      performer: r.author && r.author !== 'Unknown' ? String(r.author).slice(0, 100) : 'TikTok',
-      ...replyOpt
-    }, 'tiktok.mp3');
-  } catch (e) {
-    console.error('[tiktok mp3]', e.message);
-    await ctx.reply('🎵 MP3 tidak bisa dikirim langsung:', { ...Markup.inlineKeyboard([[Markup.button.url('⬇️ Download MP3', music.url)]]), ...replyOpt }).catch(() => {});
-  }
-}
 
 async function runTikTok(ctx) {
   if (ctx.from.id.toString() !== ADMIN_ID) return;
@@ -1815,36 +1852,141 @@ async function runTikTok(ctx) {
     const caption = `🎬 ${r.title || 'TikTok'}${author}`.slice(0, 1000);
     await removeWait();
 
-    // slideshow foto: kirim sebagai album (maks 10)
-    if (!videos.length && images.length) {
-      await ctx.sendChatAction('upload_photo').catch(() => {});
-      const group = images.slice(0, 10).map((d, i) => ({ type: 'photo', media: d.url, ...(i === 0 ? { caption } : {}) }));
-      await ctx.replyWithMediaGroup(group, replyOpt).catch(async (e) => {
-        console.error('[tiktok album gagal]', e.message);
-        const kb = Markup.inlineKeyboard(images.slice(0, 8).map((d, i) => [Markup.button.url(`🖼 Foto ${i + 1}`, d.url)]));
-        await ctx.reply(caption, { ...kb, ...replyOpt });
-      });
-      await sendTikTokMusic(ctx, music, r, replyOpt);
-      return;
-    }
-
-    if (!videos.length) throw new Error('Tidak ada video di hasil');
-    const altKb = videos[1] ? Markup.inlineKeyboard([[Markup.button.url('⬇️ Video (alternatif)', videos[1].url)]]) : {};
-
-    await ctx.sendChatAction('upload_video').catch(() => {});
-    try {
-      await sendMediaSmart(ctx, 'video', videos[0].url, { caption, supports_streaming: true, ...altKb, ...replyOpt }, 'tiktok.mp4');
-    } catch (e) {
-      console.error('[tiktok video]', e.message);
-      const btns = videos.slice(0, 2).map((v, i) => [Markup.button.url(`⬇️ Video ${i + 1}`, v.url)]);
-      await ctx.reply(`${caption}\n\n⚠️ Video tidak bisa dikirim lewat Telegram (terlalu besar), pakai tombol download.`,
-        { ...Markup.inlineKeyboard(btns), ...replyOpt });
-    }
-    await sendTikTokMusic(ctx, music, r, replyOpt);
+    const meta = {
+      title: String(r.title || 'TikTok').slice(0, 100),
+      performer: r.author && r.author !== 'Unknown' ? String(r.author).slice(0, 100) : 'TikTok'
+    };
+    const options = [];
+    if (videos.length) videos.slice(0, 3).forEach((v, i) => options.push({ kind: 'video', label: `🎬 Video ${i + 1}`, url: v.url, filename: 'tiktok.mp4' }));
+    else if (images.length) options.push({ kind: 'album', label: `🖼 Foto (${Math.min(images.length, 10)})`, urls: images.slice(0, 10).map((d) => d.url) });
+    if (music) options.push({ kind: 'audio', label: '🎵 MP3', url: music.url, filename: 'tiktok.mp3', meta });
+    if (!options.length) throw new Error('Tidak ada media di hasil');
+    await showDownloadMenu(ctx, { caption, thumbnail: r.thumbnail, options, replyOpt });
   } catch (e) {
     console.error('[tiktok]', apiError(e));
     await removeWait();
     await ctx.reply('❌ Gagal mengambil video TikTok.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
+  }
+}
+
+// ================= Spotify downloader (synoxcloud) =================
+const SPOTIFY_DL_API = process.env.SPOTIFY_DL_API || 'https://api.synoxcloud.xyz/download/spotify';
+const SYNOX_KEY = process.env.SYNOX_APIKEY || process.env.VN_APIKEY || 'FREE';
+
+async function runSpotifyDl(ctx) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const m = ctx.message.text.match(/https?:\/\/open\.spotify\.com\/\S+/i);
+  const replyOpt = { reply_to_message_id: ctx.message.message_id };
+  if (!m) return ctx.reply('Kirim link lagu Spotify.\nContoh: https://open.spotify.com/track/xxxx', replyOpt);
+
+  const wait = await ctx.reply('⏳ Mengambil data Spotify...', replyOpt);
+  const removeWait = () => ctx.deleteMessage(wait.message_id).catch(() => {});
+  try {
+    const { data } = await axios.get(SPOTIFY_DL_API, { params: { url: m[0], apikey: SYNOX_KEY }, timeout: 60000 });
+    const r = data && data.result;
+    const dls = (r && Array.isArray(r.downloads) ? r.downloads : []).filter((d) => d && /^https?:\/\//i.test(d.url || ''));
+    if (!data || !data.status || !r || !dls.length) {
+      console.log('[spotify raw]', JSON.stringify(data).slice(0, 500));
+      throw new Error((data && (data.message || data.error)) || 'Lagu tidak ditemukan (pastikan link track Spotify)');
+    }
+    const title = String(r.title || 'Unknown');
+    const artist = String(r.artist || 'Unknown');
+    const options = dls.map((d) => (d.type === 'photo'
+      ? { kind: 'photo', label: '🖼 Cover', url: d.url, filename: 'cover.jpg' }
+      : {
+        kind: 'audio', label: `🎵 MP3${d.quality ? ` ${d.quality}` : ''}`, url: d.url,
+        filename: `${artist} - ${title}`.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) + '.mp3',
+        meta: { title: title.slice(0, 100), performer: artist.slice(0, 100) }
+      }));
+    await removeWait();
+    await showDownloadMenu(ctx, { caption: `🎧 ${title}\n👤 ${artist}`, thumbnail: r.thumbnail, options, replyOpt });
+  } catch (e) {
+    console.error('[spotify]', apiError(e));
+    await removeWait();
+    await ctx.reply('❌ Gagal mengambil lagu Spotify.\n' + apiError(e).slice(0, 250), replyOpt).catch(() => {});
+  }
+}
+
+// ================= Kartu canvas (ID Card & Spotify Card) =================
+const CANVAS_BASE = process.env.CANVAS_BASE || 'https://api.synoxcloud.xyz/canvas';
+const WIZARDS = {
+  idcard: {
+    icon: '🪪', title: 'ID Card', endpoint: 'idcard',
+    fields: [
+      { key: 'name', ask: 'Kirim <b>nama</b>:', max: 40 },
+      { key: 'title', ask: 'Kirim <b>jabatan</b> (contoh: <code>Creator</code>):', max: 40 },
+      { key: 'script', ask: 'Kirim <b>teks di kartu</b> (contoh: <code>Api synox</code>):', max: 60 },
+      { key: 'contact', ask: 'Kirim <b>kontak/link</b> (contoh: <code>https://t.me/username</code>):', max: 100 }
+    ]
+  },
+  spcard: {
+    icon: '🎵', title: 'Spotify Card', endpoint: 'spotifycard',
+    fields: [
+      { key: 'title', ask: 'Kirim <b>judul lagu</b>:', max: 80 },
+      { key: 'artist', ask: 'Kirim <b>nama artis</b>:', max: 60 },
+      { key: 'cover', ask: 'Kirim <b>link gambar cover</b> (https://..., jpg/png).\nKirim <code>-</code> kalau mau cover bawaan.', max: 500, url: true, optional: true }
+    ]
+  }
+};
+const wizKb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+
+bot.action(/^wiz_(\w+)$/, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  const w = WIZARDS[ctx.match[1]];
+  if (!w) return ctx.answerCbQuery('Menu tidak dikenal');
+  await ctx.answerCbQuery();
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = 'wiz';
+  ctx.session.wiz = { key: ctx.match[1], i: 0, data: {} };
+  await safeEdit(ctx, `<b>${w.icon} ${w.title}</b>\n\n${w.fields[0].ask}`, wizKb);
+});
+
+async function canvasImage(endpoint, params) {
+  const res = await axios.get(`${CANVAS_BASE}/${endpoint}`, {
+    params: { ...params, apikey: SYNOX_KEY }, responseType: 'arraybuffer', timeout: 60000, validateStatus: () => true
+  });
+  const type = String(res.headers['content-type'] || '');
+  const buf = Buffer.from(res.data);
+  if (res.status === 200 && /^image\//i.test(type) && buf.length > 100) return buf;
+  let msg = `HTTP ${res.status}`;
+  try { const j = JSON.parse(buf.toString('utf8')); msg = j.message || j.error || msg; } catch (_) { /* bukan JSON */ }
+  throw new Error(msg);
+}
+
+async function runWizardStep(ctx) {
+  const wiz = ctx.session.wiz;
+  const w = wiz && WIZARDS[wiz.key];
+  if (!w) { ctx.session.step = null; return; }
+  const f = w.fields[wiz.i];
+  const value = ctx.message.text.trim();
+  if (!value) return;
+  if (f.url && !(f.optional && value === '-')) {
+    if (!/^https?:\/\/\S+$/i.test(value)) return ctx.reply('❌ Harus berupa link gambar yang diawali https://', wizKb);
+  }
+  if (!(f.optional && value === '-')) wiz.data[f.key] = value.slice(0, f.max);
+  wiz.i++;
+  if (wiz.i < w.fields.length) {
+    return ctx.reply(`<b>${w.icon} ${w.title}</b>\n\n${w.fields[wiz.i].ask}`, { parse_mode: 'HTML', ...wizKb });
+  }
+
+  const data = wiz.data;
+  ctx.session.step = null;
+  ctx.session.wiz = null;
+  const wait = await ctx.reply('⏳ Membuat kartu...');
+  const again = Markup.inlineKeyboard([[Markup.button.callback('🔁 Buat lagi', `wiz_${wiz.key}`), Markup.button.callback('⬅️ Menu', 'back_menu')]]);
+  try {
+    await ctx.sendChatAction('upload_photo').catch(() => {});
+    const buf = await canvasImage(w.endpoint, data);
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+    try {
+      await ctx.replyWithPhoto({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
+    } catch (e) {
+      await ctx.replyWithDocument({ source: buf, filename: `${w.endpoint}.png` }, { caption: `${w.icon} ${w.title} selesai`, ...again });
+    }
+  } catch (e) {
+    console.error('[canvas]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Gagal membuat kartu: ' + apiError(e).slice(0, 250), again).catch(() => {});
   }
 }
 
@@ -1858,6 +2000,8 @@ const INPUT_FLOWS = {
     hint: 'Kirim link Instagram (post, reel, atau story).\nContoh: <code>https://www.instagram.com/reel/xxxx/</code>' },
   tiktok: { icon: '🎬', title: 'TikTok Downloader', run: runTikTok,
     hint: 'Kirim link TikTok (video atau slideshow foto).\nContoh: <code>https://vt.tiktok.com/ZSxxxxxx/</code>' },
+  spotify: { icon: '🎧', title: 'Spotify Downloader', run: runSpotifyDl,
+    hint: 'Kirim link lagu Spotify (bukan judul).\nContoh: <code>https://open.spotify.com/track/xxxx</code>' },
   fb: { icon: '📘', title: 'Facebook Downloader', run: runFacebook,
     hint: 'Kirim link video Facebook.\nContoh: <code>https://www.facebook.com/share/r/xxxx/</code>' },
   terabox: { icon: '📦', title: 'Terabox Downloader', run: runTerabox,
@@ -1890,6 +2034,7 @@ bot.on('text', async (ctx) => {
 
   // ---- fitur dari tombol menu (play, ig, fb, terabox, imagine, nomor, hd) ----
   const stepName = typeof ctx.session.step === 'string' && ctx.session.step.startsWith('in_') ? ctx.session.step.slice(3) : null;
+  if (ctx.session.step === 'wiz') return runWizardStep(ctx);
   if (stepName === 'nomor') return runNomor(ctx);
   if (stepName === 'hd') return ctx.reply('🖼 Kirim fotonya (bukan teks) ya.');
   if (stepName && INPUT_FLOWS[stepName]) return INPUT_FLOWS[stepName].run(ctx);
