@@ -698,6 +698,7 @@ const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('📘 Facebook', 'flow_fb'), Markup.button.callback('🎬 TikTok', 'flow_tiktok')],
   [Markup.button.callback('🎧 Spotify', 'flow_spotify'), Markup.button.callback('📦 Terabox', 'flow_terabox')],
   [Markup.button.callback('🎨 Buat Gambar', 'flow_imagine'), Markup.button.callback('📱 Nomor Virtual', 'vn_menu')],
+  [Markup.button.callback('⭐ AM Bulk', 'flow_ambulk')],
   [Markup.button.callback('🪪 ID Card', 'wiz_idcard'), Markup.button.callback('🎵 Spotify Card', 'wiz_spcard')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
@@ -775,6 +776,7 @@ function helpText() {
     `<b>⚡ Command cepat</b> (tanpa isi = buka mode input)\n` +
     `/play judul • /ig /fb /tiktok /spotify /terabox link • /hd (reply foto)\n` +
     `/imagine prompt • /nomor negara • /ai pesan • /coder perintah\n` +
+    `/ambulk jumlah (1-10)\n` +
     `/idcard nama | jabatan | teks | kontak\n` +
     `/spcard judul | artis | cover • /menu • /help\n\n` +
     `Kalau error, coba lagi atau hubungi admin.`
@@ -1195,37 +1197,56 @@ async function findVideo(query) {
   return search.videos[0];
 }
 
-// Fallback kedua (play2): dipakai otomatis jika jalur utama gagal.
-// Isi FAA_API di .env (base URL, tanpa slash di akhir), contoh: FAA_API=https://domain-api-kamu
-const FAA_API = clean(process.env.FAA_API).replace(/\/+$/, '');
+// Fallback kedua (SoundCloud): dipakai otomatis jika jalur utama gagal.
+// Modul milik bot WA, isi path-nya di .env, contoh:
+//   SC_SEARCH_PATH=/root/bot/plugins/soundcloud.js      (export: scSearch)
+//   SC_DL_PATH=/root/bot/src/scraper/soundclouddl.js    (export default: scdl)
+const SC_SEARCH_PATH = clean(process.env.SC_SEARCH_PATH);
+const SC_DL_PATH = clean(process.env.SC_DL_PATH);
+const scMods = {};
+async function loadSc(key, file) {
+  if (scMods[key]) return scMods[key];
+  if (!file) throw new Error(`${key === 'search' ? 'SC_SEARCH_PATH' : 'SC_DL_PATH'} belum diisi di .env`);
+  scMods[key] = await import(require('url').pathToFileURL(file).href);
+  return scMods[key];
+}
 
 async function playFallback(ctx, query, skipThumb = false) {
-  if (!FAA_API) throw new Error('FAA_API belum diisi di .env');
+  const { scSearch } = await loadSc('search', SC_SEARCH_PATH);
+  const scdlMod = await loadSc('dl', SC_DL_PATH);
+  const scdl = scdlMod.default;
+  if (typeof scSearch !== 'function' || typeof scdl !== 'function') throw new Error('Modul SoundCloud tidak valid');
 
-  const { data: json } = await axios.get(`${FAA_API}/faa/ytplay`, { params: { query }, timeout: 90000 });
-  if (!json || !json.status || !json.result || !json.result.mp3) throw new Error('API fallback error');
-  const d = json.result;
+  const results = await scSearch(query);
+  if (!results || !results.length) throw new Error('Lagu tidak ditemukan di SoundCloud');
+  const track = results[0];
+  const info = await scdl(track.url);
+  if (!info || !info.download_url) throw new Error('Gagal mendapatkan audio SoundCloud');
 
   const caption =
-    `🎵 NOW PLAYING\n\n` +
-    `📌 Judul: ${d.title || query}\n` +
-    `👤 Channel: ${d.author || '-'}\n` +
-    `👀 Views: ${d.views != null ? formatNumber(d.views) : '-'}\n\n` +
-    `🔗 YouTube: ${d.url || '-'}`;
+    `🎵 NOW PLAYING (SoundCloud)\n\n` +
+    `📌 Judul: ${info.title || track.title || query}\n` +
+    `👤 Uploader: ${info.uploader || '-'}\n` +
+    `⏱️ Durasi: ${info.duration || '-'}\n` +
+    `👁️ Views: ${info.views != null ? info.views : '-'}\n` +
+    `❤️ Likes: ${info.likes != null ? info.likes : '-'}\n` +
+    `📦 Ukuran: ${info.size || '-'}\n\n` +
+    `🔗 ${track.url}`;
 
   await ctx.sendChatAction('upload_voice').catch(() => {});
-  if (d.thumbnail && !skipThumb) {
-    await ctx.replyWithPhoto(d.thumbnail, { caption: caption.slice(0, 1000) })
-      .catch((e) => console.error('[play2 thumb]', e.message));
+  const thumb = info.thumbnail || track.artwork;
+  if (thumb && !skipThumb) {
+    await ctx.replyWithPhoto(thumb, { caption: caption.slice(0, 1000) })
+      .catch((e) => console.error('[play sc thumb]', e.message));
   }
 
-  const title = String(d.title || query);
-  const opts = { title: title.slice(0, 100), performer: d.author ? String(d.author) : undefined };
+  const title = String(info.title || track.title || query);
+  const opts = { title: title.slice(0, 100), performer: info.uploader ? String(info.uploader) : undefined };
   try {
-    await ctx.replyWithAudio(d.mp3, opts);
+    await ctx.replyWithAudio(info.download_url, opts);
   } catch (e) {
-    console.error('[play2 url gagal, unduh manual]', e.message);
-    const dl = await axios.get(d.mp3, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
+    console.error('[play sc url gagal, unduh manual]', e.message);
+    const dl = await axios.get(info.download_url, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
     const filename = title.replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 80) || 'audio';
     await ctx.replyWithAudio({ source: Buffer.from(dl.data), filename: `${filename}.mp3` }, opts);
   }
@@ -1277,11 +1298,69 @@ async function runPlay(ctx) {
       await playFallback(ctx, query, thumbSent);
       await ctx.deleteMessage(wait.message_id).catch(() => {});
     } catch (e2) {
-      console.error('[play2]', apiError(e2));
+      console.error('[play sc]', apiError(e2));
       await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
         '❌ PLAY GAGAL\n\n' + String(apiError(e) || 'Gagal mengambil audio.').slice(0, 200) +
         '\n\nCadangan: ' + String(apiError(e2)).slice(0, 150)).catch(() => {});
     }
+  }
+}
+
+// ================= /ambulk (Alight Motion Premium bulk) =================
+const AMBULK_API = process.env.AMBULK_API || 'https://api.nexadev.my.id/am/bulk/';
+const AMBULK_KEY = clean(process.env.AMBULK_KEY) || 'RS-aBk3ue&5';
+
+async function runAmBulk(ctx) {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const input = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/i, '').trim();
+  const amount = input === '' ? 1 : parseInt(input, 10);
+
+  if (!Number.isInteger(amount) || amount < 1 || amount > 10) {
+    return ctx.reply('⚠️ <b>Jumlah Tidak Valid</b>\n\nKirim angka 1-10.\nContoh: <code>/ambulk 3</code>', { parse_mode: 'HTML' });
+  }
+
+  const wait = await ctx.reply(`⏳ Membuat ${amount} akun Alight Motion Premium...`);
+  try {
+    const { data } = await axios.get(AMBULK_API, {
+      params: { key: AMBULK_KEY, amount },
+      headers: { 'User-Agent': UA },
+      timeout: 30000
+    });
+
+    if (!(data && (data.status || data.success) && Array.isArray(data.data))) {
+      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+        '❌ Gagal Generate: ' + String((data && data.message) || 'Terjadi kesalahan pada API.').slice(0, 300)).catch(() => {});
+    }
+
+    let out = `✨ <b>ALIGHT MOTION BULK GENERATOR</b> ✨\n\n`;
+    out += `📦 <b>Jumlah Akun:</b> ${data.data.length}\n`;
+    if (data.limit_left !== undefined) out += `🪙 <b>Sisa Limit API:</b> ${escapeHtml(data.limit_left)}\n`;
+    out += `───────────────────\n\n`;
+    data.data.forEach((acc, i) => {
+      out += `<b>${i + 1}. Akun Alight Motion</b>\n`;
+      out += `📧 <b>Email:</b> <code>${escapeHtml(acc.account)}</code>\n`;
+      out += `🔗 <b>Login/Inbox:</b> ${escapeHtml(acc.login_url)}\n`;
+      out += `🌟 <b>Status:</b> ${escapeHtml(acc.status)}\n\n`;
+    });
+    out += `<i>Gunakan URL Login/Inbox di atas untuk memverifikasi akun saat masuk aplikasi!</i>`;
+
+    // batas pesan Telegram 4096 karakter -> pecah per akun jika kepanjangan
+    const chunks = [];
+    let cur = '';
+    for (const part of out.split('\n\n')) {
+      if ((cur + '\n\n' + part).length > 3800) { chunks.push(cur); cur = part; }
+      else cur = cur ? cur + '\n\n' + part : part;
+    }
+    if (cur) chunks.push(cur);
+
+    for (const c of chunks) {
+      await ctx.reply(c, { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+  } catch (e) {
+    console.error('[ambulk]', apiError(e));
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Terjadi Kesalahan: ' + apiError(e).slice(0, 300)).catch(() => {});
   }
 }
 
@@ -2139,6 +2218,8 @@ async function runWizardStep(ctx) {
 const INPUT_FLOWS = {
   play: { icon: '🎵', title: 'Play Musik', run: runPlay,
     hint: 'Kirim judul lagu atau link YouTube.\nContoh: <code>dewa 19 kangen</code>' },
+  ambulk: { icon: '⭐', title: 'AM Premium Bulk', run: runAmBulk,
+    hint: 'Kirim jumlah akun yang mau dibuat (1-10).\nContoh: <code>3</code>' },
   hd: { icon: '🖼', title: 'HD Foto (Upscale)', run: runHd,
     hint: 'Kirim foto yang mau di-upscale jadi HD (sebagai foto atau file gambar).' },
   ig: { icon: '📸', title: 'Instagram Downloader', run: runInstagram,
@@ -2202,7 +2283,7 @@ async function runAiChat(ctx, prompt) {
 const CMD_FLOWS = [
   [['play'], 'play'], [['hd'], 'hd'], [['ig', 'instagram', 'igdl'], 'ig'], [['fb', 'facebook', 'fbdl'], 'fb'],
   [['tiktok', 'tt'], 'tiktok'], [['spotify', 'spotifydl'], 'spotify'], [['terabox', 'tera'], 'terabox'],
-  [['imagine', 'txt2img'], 'imagine']
+  [['imagine', 'txt2img'], 'imagine'], [['ambulk', 'amremlist', 'bulkam', 'ambulkgen'], 'ambulk']
 ];
 for (const [names, key] of CMD_FLOWS) {
   bot.command(names, async (ctx) => {
@@ -2290,7 +2371,7 @@ bot.command('help', async (ctx) => {
 const CMD_MENU = [
   ['play', 'Cari & kirim lagu YouTube'], ['hd', 'Upscale foto jadi HD (reply foto)'],
   ['ig', 'Download Instagram'], ['fb', 'Download Facebook'], ['tiktok', 'Download TikTok'],
-  ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['imagine', 'Buat gambar dari teks (SFW)'],
+  ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['imagine', 'Buat gambar dari teks (SFW)'], ['ambulk', 'Bulk akun Alight Motion Premium'],
   ['nomor', 'Nomor virtual publik'], ['ai', 'Ngobrol dengan AI'], ['coder', 'AI Coder (bikin kode)'],
   ['idcard', 'Buat ID Card'], ['spcard', 'Buat Spotify Card'], ['menu', 'Buka menu utama'], ['help', 'Bantuan']
 ].map(([command, description]) => ({ command, description }));
