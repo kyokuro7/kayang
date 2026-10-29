@@ -691,6 +691,234 @@ async function generateFakeMl({ avatar, username, rank, border }) {
   return img;
 }
 
+// ================= BACKUP (zip murni stdlib, tanpa dependensi) =================
+const PROJECT_DIR = __dirname;
+const BACKUP_DIR = path.join(PROJECT_DIR, 'backups');
+const BACKUP_MAX_FILES = 400;
+const BACKUP_MAX_BYTES = 20 * 1024 * 1024;
+const BACKUP_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const BACKUP_KEEP = Math.max(1, parseInt(clean(process.env.BACKUP_KEEP), 10) || 10);
+const BACKUP_INTERVAL_HOURS = Number(clean(process.env.BACKUP_INTERVAL_HOURS) || 6);
+const BACKUP_EXCLUDE_DIRS = new Set(['node_modules', '.git', 'backups', '.cache', 'tmp', '.tmp', 'dist', 'logs', 'coverage']);
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+function dosDateTime(d = new Date()) {
+  const time = ((d.getHours() & 31) << 11) | ((d.getMinutes() & 63) << 5) | ((Math.floor(d.getSeconds() / 2)) & 31);
+  const date = (((d.getFullYear() - 1980) & 127) << 9) | (((d.getMonth() + 1) & 15) << 5) | (d.getDate() & 31);
+  return { time, date };
+}
+
+// ZIP method 0 (store) - aman, tidak butuh library
+function zipBuild(files) {
+  const { time, date } = dosDateTime();
+  const parts = [];
+  const centrals = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(String(f.name).replace(/\\/g, '/'), 'utf8');
+    const data = Buffer.isBuffer(f.data) ? f.data : Buffer.from(String(f.data), 'utf8');
+    const crc = crc32(data);
+
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4);
+    lh.writeUInt16LE(0x0800, 6); // flag: nama file UTF-8
+    lh.writeUInt16LE(0, 8);      // method: store
+    lh.writeUInt16LE(time, 10);
+    lh.writeUInt16LE(date, 12);
+    lh.writeUInt32LE(crc, 14);
+    lh.writeUInt32LE(data.length, 18);
+    lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(name.length, 26);
+    lh.writeUInt16LE(0, 28);
+    parts.push(lh, name, data);
+
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4);   // version made by
+    ch.writeUInt16LE(20, 6);   // version needed
+    ch.writeUInt16LE(0x0800, 8);
+    ch.writeUInt16LE(0, 10);
+    ch.writeUInt16LE(time, 12);
+    ch.writeUInt16LE(date, 14);
+    ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(data.length, 20);
+    ch.writeUInt32LE(data.length, 24);
+    ch.writeUInt16LE(name.length, 28);
+    ch.writeUInt16LE(0, 30);
+    ch.writeUInt16LE(0, 32);
+    ch.writeUInt16LE(0, 34);
+    ch.writeUInt16LE(0, 36);
+    ch.writeUInt32LE(0, 38);
+    ch.writeUInt32LE(offset, 42);
+    centrals.push(Buffer.concat([ch, name]));
+
+    offset += lh.length + name.length + data.length;
+  }
+  const cd = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cd.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([...parts, cd, eocd]);
+}
+
+function collectProjectFiles(dir = PROJECT_DIR, rel = '', acc = [], state = { bytes: 0 }) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return acc; }
+  for (const e of entries) {
+    if (acc.length >= BACKUP_MAX_FILES) return acc;
+    const r = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) {
+      if (BACKUP_EXCLUDE_DIRS.has(e.name) || e.name.startsWith('.')) continue;
+      collectProjectFiles(path.join(dir, e.name), r, acc, state);
+    } else if (e.isFile()) {
+      const lower = e.name.toLowerCase();
+      if (lower.endsWith('.zip') || lower.endsWith('.log')) continue;
+      const full = path.join(dir, e.name);
+      let st;
+      try { st = fs.statSync(full); } catch (_) { continue; }
+      if (st.size > BACKUP_MAX_FILE_BYTES) continue;
+      if (state.bytes + st.size > BACKUP_MAX_BYTES) continue;
+      let buf;
+      try { buf = fs.readFileSync(full); } catch (_) { continue; }
+      state.bytes += buf.length;
+      acc.push({ name: r, data: buf });
+    }
+  }
+  return acc;
+}
+
+function backupStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function listBackups() {
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    return fs.readdirSync(BACKUP_DIR)
+      .filter((f) => /^backup-.*\.zip$/i.test(f))
+      .map((f) => {
+        const st = fs.statSync(path.join(BACKUP_DIR, f));
+        return { name: f, size: st.size, at: st.mtime };
+      })
+      .sort((a, b) => b.at - a.at);
+  } catch (_) { return []; }
+}
+
+function pruneBackups() {
+  const list = listBackups();
+  for (const b of list.slice(BACKUP_KEEP)) {
+    try { fs.unlinkSync(path.join(BACKUP_DIR, b.name)); } catch (_) {}
+  }
+}
+
+function createBackup(saveToDisk = true) {
+  const files = collectProjectFiles();
+  const manifest = {
+    created_at: new Date().toISOString(),
+    host: os.hostname(),
+    platform: process.platform,
+    node: process.version,
+    cwd: PROJECT_DIR,
+    total_files: files.length,
+    total_bytes: files.reduce((a, f) => a + f.data.length, 0),
+    files: files.map((f) => f.name)
+  };
+  files.push({ name: 'BACKUP-INFO.json', data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8') });
+  const buf = zipBuild(files);
+  const filename = `backup-${backupStamp()}.zip`;
+  let saved = false;
+  if (saveToDisk) {
+    try {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      fs.writeFileSync(path.join(BACKUP_DIR, filename), buf);
+      pruneBackups();
+      saved = true;
+    } catch (e) {
+      console.error('[backup save]', e.message);
+    }
+  }
+  return { buf, filename, manifest, files, saved };
+}
+
+const kbFmt = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1024).toFixed(1)} KB`);
+
+const backupKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('📂 Daftar Backup', 'backup_list'), Markup.button.callback('💾 Backup Lagi', 'backup_now')],
+  [Markup.button.callback('⬅️ Menu', 'back_menu')]
+]);
+
+function backupSummary(r) {
+  const names = r.manifest.files.map((n) => `• <code>${escapeHtml(n)}</code>`).join('\n');
+  return `<b>💾 Backup selesai</b>\n\n` +
+    `📦 File: <b>${r.manifest.total_files}</b>\n` +
+    `📄 Ukuran: <b>${kbFmt(r.buf.length)}</b>\n` +
+    `🕒 ${escapeHtml(r.manifest.created_at)}\n` +
+    `💽 Disimpan: ${r.saved ? '<b>ya</b> (folder backups/)' : '<b>tidak</b>'}\n\n` +
+    `<i>Isi arsip:</i>\n${names.slice(0, 1200)}`;
+}
+
+async function doBackup(ctx) {
+  const wait = await ctx.reply('💾 Membuat backup...');
+  try {
+    const r = createBackup();
+    await ctx.deleteMessage(wait.message_id).catch(() => {});
+    await ctx.replyWithDocument(
+      { source: r.buf, filename: r.filename },
+      { caption: backupSummary(r), parse_mode: 'HTML', ...backupKeyboard }
+    );
+  } catch (e) {
+    console.error('[backup]', e.message);
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null,
+      '❌ Gagal membuat backup: ' + escapeHtml(String(e.message).slice(0, 300)),
+      { parse_mode: 'HTML', ...backupKeyboard }).catch(() => {});
+  }
+}
+
+function startAutoBackup() {
+  if (!(BACKUP_INTERVAL_HOURS > 0)) return;
+  const ms = BACKUP_INTERVAL_HOURS * 3600 * 1000;
+  const run = async () => {
+    try {
+      const r = createBackup();
+      console.log(`[auto backup] ${r.filename} (${r.manifest.total_files} file, ${kbFmt(r.buf.length)})`);
+      await bot.telegram.sendDocument(
+        ADMIN_ID,
+        { source: r.buf, filename: r.filename },
+        { caption: `💾 <b>Auto backup</b>\n📦 ${r.manifest.total_files} file • ${kbFmt(r.buf.length)}`, parse_mode: 'HTML' }
+      ).catch((e) => console.error('[auto backup kirim]', e.message));
+    } catch (e) {
+      console.error('[auto backup]', e.message);
+    }
+  };
+  setTimeout(run, 30000).unref?.();
+  setInterval(run, ms).unref?.();
+  console.log(`⏱️ Auto backup aktif tiap ${BACKUP_INTERVAL_HOURS} jam (simpan maks ${BACKUP_KEEP} file)`);
+}
+
 const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🔍 Find Preset AM', 'find_preset')],
   [Markup.button.callback('📧 Temp Mail', 'tempmail'), Markup.button.callback('⭐ AM Premium', 'am_premium')],
@@ -701,6 +929,7 @@ const mainMenu = Markup.inlineKeyboard([
   [Markup.button.callback('🎧 Spotify', 'flow_spotify'), Markup.button.callback('📦 Terabox', 'flow_terabox')],
   [Markup.button.callback('📹 HD Video', 'flow_hdvid')],
   [Markup.button.callback('🪪 ID Card', 'wiz_idcard'), Markup.button.callback('🎵 Spotify Card', 'wiz_spcard')],
+  [Markup.button.callback('💾 Backup Bot', 'backup_now')],
   [Markup.button.callback('📖 Bantuan', 'help'), Markup.button.callback('👤 Profil', 'profile')]
 ]);
 
@@ -771,12 +1000,13 @@ function helpText() {
     `<b>🎮 Fake ML</b>: buat kartu profil Mobile Legends palsu (username, avatar, rank, border).\n` +
     `<b>🤖 AI Chat</b>: ngobrol biasa dengan AI, ingat obrolan sampai kamu tekan Chat Baru.\n` +
     `<b>💻 AI Coder</b>: khusus bikin kode, hasilnya dikirim sebagai file (.html/.css/.js, dll) dan bisa direvisi.\n` +
+    `<b>💾 Backup Bot</b>: kirim zip semua file bot (index.js, package.json, .env) ke chat, plus simpan otomatis ke folder <code>backups/</code>. Pakai <code>/backup</code> dan <code>/backups</code>.\n` +
     `<b>⭐ AM Premium</b>: login Satriam lewat magic link (kirim email → tempel link dari inbox).\n\n` +
     `<b>⚡ Command cepat</b> (tanpa isi = buka mode input)\n` +
     `/play judul • /ig /fb /tiktok /spotify /terabox link • /hd (reply foto)\n` +
     `/ai pesan • /coder perintah • /hdvid (reply video)\n` +
     `/idcard nama | jabatan | teks | kontak\n` +
-    `/spcard judul | artis | cover • /menu • /help\n\n` +
+    `/spcard judul | artis | cover • /backup • /backups • /menu • /help\n\n` +
     `Kalau error, coba lagi atau hubungi admin.`
   );
 }
@@ -801,6 +1031,48 @@ bot.action('profile', async (ctx) => {
     `Bot: @${ctx.botInfo.username}`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Kembali', 'back_menu')]]) }
   );
+});
+
+// ---------- Backup: tombol menu ----------
+bot.action('backup_now', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  await ctx.answerCbQuery('💾 Membuat backup...');
+  return doBackup(ctx);
+});
+
+bot.action('backup_list', async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  await ctx.answerCbQuery();
+  const list = listBackups();
+  if (!list.length) {
+    return safeEdit(ctx, '<b>📂 Daftar Backup</b>\n\nBelum ada backup tersimpan. Tekan <b>Backup Lagi</b>.',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('💾 Backup Lagi', 'backup_now')],
+        [Markup.button.callback('⬅️ Menu', 'back_menu')]
+      ]));
+  }
+  const shown = list.slice(0, 10);
+  const rows = shown.map((b) => [Markup.button.callback(`${b.name.replace(/^backup-|\.zip$/g, '')} • ${kbFmt(b.size)}`.slice(0, 60), `bkp:${b.name}`)]);
+  rows.push([Markup.button.callback('💾 Backup Lagi', 'backup_now'), Markup.button.callback('⬅️ Menu', 'back_menu')]);
+  const text = `<b>📂 Daftar Backup</b>\n\nTotal: <b>${list.length}</b> file (folder <code>backups/</code>)\n` +
+    `Ditampilkan maks 10 terbaru. Tekan untuk mengunduh.\n`;
+  await safeEdit(ctx, text, Markup.inlineKeyboard(rows));
+});
+
+bot.action(/^bkp:(backup-[\w.\-]+\.zip)$/i, async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.answerCbQuery('❌ Akses ditolak');
+  const name = ctx.match[1];
+  const full = path.join(BACKUP_DIR, name);
+  if (!full.startsWith(BACKUP_DIR) || !fs.existsSync(full)) return ctx.answerCbQuery('File tidak ditemukan', { show_alert: true });
+  await ctx.answerCbQuery('📤 Mengirim...');
+  try {
+    const st = fs.statSync(full);
+    await ctx.replyWithDocument({ source: fs.createReadStream(full), filename: name },
+      { caption: `💾 <b>${escapeHtml(name)}</b>\n📄 ${kbFmt(st.size)}`, parse_mode: 'HTML' });
+  } catch (e) {
+    console.error('[bkp]', e.message);
+    await ctx.reply('❌ Gagal mengirim backup: ' + String(e.message).slice(0, 200));
+  }
 });
 
 bot.action('tempmail', async (ctx) => {
@@ -2124,6 +2396,32 @@ for (const [names, key] of [[['idcard'], 'idcard'], [['spcard', 'spotifycard'], 
   });
 }
 
+// /backup (buat + kirim zip)  /backups (daftar backup tersimpan)
+bot.command(['backup', 'backupbot', 'bkp'], async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  ctx.session.waitingForUrl = false;
+  ctx.session.step = null;
+  return doBackup(ctx);
+});
+
+bot.command('backups', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  const list = listBackups();
+  if (!list.length) {
+    return ctx.reply('<b>📂 Daftar Backup</b>\n\nBelum ada backup tersimpan.', {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([[Markup.button.callback('💾 Backup Sekarang', 'backup_now'), Markup.button.callback('⬅️ Menu', 'back_menu')]])
+    });
+  }
+  const shown = list.slice(0, 10);
+  const rows = shown.map((b) => [Markup.button.callback(`${b.name.replace(/^backup-|\.zip$/g, '')} • ${kbFmt(b.size)}`.slice(0, 60), `bkp:${b.name}`)]);
+  rows.push([Markup.button.callback('💾 Backup Sekarang', 'backup_now'), Markup.button.callback('⬅️ Menu', 'back_menu')]);
+  return ctx.reply(
+    `<b>📂 Daftar Backup</b>\n\nTotal: <b>${list.length}</b> file di <code>backups/</code>\nAuto backup: tiap <b>${BACKUP_INTERVAL_HOURS}</b> jam, simpan maks <b>${BACKUP_KEEP}</b> file.\n\nTekan untuk mengunduh:`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) }
+  );
+});
+
 bot.command('menu', async (ctx) => {
   if (!adminOnly(ctx)) return;
   ctx.session.waitingForUrl = false;
@@ -2144,7 +2442,9 @@ const CMD_MENU = [
   ['ig', 'Download Instagram'], ['fb', 'Download Facebook'], ['tiktok', 'Download TikTok'],
   ['spotify', 'Download lagu Spotify'], ['terabox', 'Ambil link Terabox'], ['hdvid', 'Enhance video jadi HD (reply video)'],
   ['ai', 'Ngobrol dengan AI'], ['coder', 'AI Coder (bikin kode)'],
-  ['idcard', 'Buat ID Card'], ['spcard', 'Buat Spotify Card'], ['menu', 'Buka menu utama'], ['help', 'Bantuan']
+  ['idcard', 'Buat ID Card'], ['spcard', 'Buat Spotify Card'],
+  ['backup', 'Backup semua file bot (zip)'], ['backups', 'Daftar backup tersimpan'],
+  ['menu', 'Buka menu utama'], ['help', 'Bantuan']
 ].map(([command, description]) => ({ command, description }));
 
 bot.on('text', async (ctx) => {
@@ -2304,7 +2604,8 @@ bot.telegram.getMe()
   .then(async (me) => {
     console.log(`✅ Token valid: @${me.username}`);
     await bot.telegram.setMyCommands(CMD_MENU).catch((e) => console.error('[setMyCommands]', e.message));
-    return bot.launch();
+    await bot.launch();
+    startAutoBackup();
   })
   .catch((err) => {
     console.error('❌ Gagal start bot:', err.message);
